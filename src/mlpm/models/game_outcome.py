@@ -1,0 +1,1182 @@
+from __future__ import annotations
+
+import pickle
+from dataclasses import dataclass
+from pathlib import Path
+
+import mlflow
+import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+
+from mlpm.config.settings import settings
+from mlpm.features.matchups import OFFENSE_SPLIT_PRIOR, offense_score_from_stats, offense_split_value
+from mlpm.features.team_strength import ELO_BASELINE, ELO_K_FACTOR, RECENT_GAMES_WINDOW
+from mlpm.ingest.mlb_stats import fetch_final_results, fetch_game_batting_logs, fetch_game_pitching_logs
+from mlpm.storage.duckdb import connect, query_dataframe
+
+LOGISTIC_MODEL_NAME = "mlb_win_logreg_v2"
+HISTGB_MODEL_NAME = "mlb_win_histgb_v1"
+KNN_MODEL_NAME = "mlb_win_knn_v1"
+SVM_MODEL_NAME = "mlb_win_svm_rbf_v1"
+BAYES_MODEL_NAME = "mlb_win_bayes_v1"
+FEATURE_COLUMNS = [
+    "season_win_pct_diff",
+    "recent_win_pct_diff",
+    "venue_win_pct_diff",
+    "run_diff_per_game_diff",
+    "season_runs_scored_per_game_diff",
+    "season_runs_allowed_per_game_adv",
+    "recent_runs_scored_per_game_diff",
+    "recent_runs_allowed_per_game_adv",
+    "rest_days_diff",
+    "venue_streak_diff",
+    "travel_switch_adv",
+    "doubleheader_flag",
+    "streak_diff",
+    "elo_diff",
+    "elo_home_win_prob",
+    "market_home_implied_prob",
+    "offense_vs_starter_hand_diff",
+    "starter_era_adv",
+    "starter_whip_adv",
+    "starter_strikeouts_per_9_diff",
+    "starter_walks_per_9_adv",
+    "bullpen_innings_3d_adv",
+    "bullpen_pitches_3d_adv",
+    "relievers_used_3d_adv",
+]
+BAYES_EVIDENCE_FEATURE_COLUMNS = [column for column in FEATURE_COLUMNS if column != "market_home_implied_prob"]
+STARTER_LOOKBACK_GAMES = 5
+
+
+@dataclass
+class TeamSnapshot:
+    games_played: int
+    season_win_pct: float
+    recent_win_pct: float
+    venue_win_pct: float
+    run_diff_per_game: float
+    season_runs_scored_per_game: float
+    season_runs_allowed_per_game: float
+    recent_runs_scored_per_game: float
+    recent_runs_allowed_per_game: float
+    streak: int
+    elo_rating: float
+    last_game_date: pd.Timestamp | None
+    last_is_home: bool | None
+    current_venue_streak: int
+
+
+@dataclass(frozen=True)
+class InformationCriteriaResult:
+    features: tuple[str, ...]
+    log_likelihood: float
+    aic: float
+    bic: float
+    metrics: dict[str, float]
+
+
+def artifact_path() -> Path:
+    return settings().artifacts_dir / "game_outcome_model.pkl"
+
+
+def load_trained_model(path: Path | None = None) -> dict[str, object] | None:
+    model_path = path or artifact_path()
+    if not model_path.exists():
+        return None
+    with model_path.open("rb") as handle:
+        return pickle.load(handle)
+
+
+def save_trained_model(bundle: dict[str, object], path: Path | None = None) -> Path:
+    model_path = path or artifact_path()
+    with model_path.open("wb") as handle:
+        pickle.dump(bundle, handle)
+    return model_path
+
+
+def fetch_training_inputs(start_date: str, end_date: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    return (
+        fetch_final_results(start_date, end_date),
+        fetch_game_pitching_logs(start_date, end_date),
+        fetch_game_batting_logs(start_date, end_date),
+        _load_historical_market_priors(start_date, end_date),
+    )
+
+
+def build_training_dataset(
+    results_df: pd.DataFrame,
+    pitching_logs_df: pd.DataFrame,
+    batting_logs_df: pd.DataFrame | None = None,
+    market_priors_df: pd.DataFrame | None = None,
+    min_games: int | None = None,
+) -> pd.DataFrame:
+    if results_df.empty:
+        return pd.DataFrame()
+
+    minimum_games = settings().model_min_games if min_games is None else min_games
+    results = results_df.copy()
+    results["game_date"] = pd.to_datetime(results["game_date"])
+
+    pitching_logs = pitching_logs_df.copy()
+    if not pitching_logs.empty:
+        pitching_logs["game_date"] = pd.to_datetime(pitching_logs["game_date"])
+        pitching_lookup = pitching_logs.set_index(["game_id", "team"]).to_dict(orient="index")
+    else:
+        pitching_lookup = {}
+    batting_lookup = {}
+    if batting_logs_df is not None and not batting_logs_df.empty:
+        batting_logs = batting_logs_df.copy()
+        batting_logs["game_date"] = pd.to_datetime(batting_logs["game_date"])
+        batting_lookup = batting_logs.set_index(["game_id", "team"]).to_dict(orient="index")
+    market_prior_lookup: dict[str, float] = {}
+    if market_priors_df is not None and not market_priors_df.empty:
+        market_prior_lookup = (
+            market_priors_df.drop_duplicates(subset=["game_id"]).set_index("game_id")["market_home_implied_prob"].to_dict()
+        )
+
+    team_history: dict[str, list[dict[str, object]]] = {}
+    pitcher_history: dict[int, list[dict[str, float]]] = {}
+    team_pitching_history: dict[str, list[dict[str, object]]] = {}
+    team_offense_hand_history: dict[str, list[dict[str, object]]] = {}
+    elo_ratings: dict[str, float] = {}
+    rows: list[dict[str, object]] = []
+
+    for game in results.sort_values(["game_date", "game_id"]).to_dict(orient="records"):
+        home_team = game["home_team"]
+        away_team = game["away_team"]
+        home_games = team_history.get(home_team, [])
+        away_games = team_history.get(away_team, [])
+        home_elo = elo_ratings.get(home_team, ELO_BASELINE)
+        away_elo = elo_ratings.get(away_team, ELO_BASELINE)
+        if min(len(home_games), len(away_games)) >= minimum_games:
+            game_date = pd.to_datetime(game["game_date"])
+            home_snapshot = _snapshot_team(home_games, venue_home=True, elo_rating=home_elo)
+            away_snapshot = _snapshot_team(away_games, venue_home=False, elo_rating=away_elo)
+            home_pitching = _pregame_pitching_context(game["game_id"], home_team, pitching_lookup, pitcher_history, team_pitching_history)
+            away_pitching = _pregame_pitching_context(game["game_id"], away_team, pitching_lookup, pitcher_history, team_pitching_history)
+            home_offense_vs_opp_hand = _offense_vs_hand_before_game(team_offense_hand_history.get(home_team, []), away_pitching.get("pitcher_hand"))
+            away_offense_vs_opp_hand = _offense_vs_hand_before_game(team_offense_hand_history.get(away_team, []), home_pitching.get("pitcher_hand"))
+            is_doubleheader = _team_games_on_date(team_history.get(home_team, []), game_date) > 0 or _team_games_on_date(team_history.get(away_team, []), game_date) > 0
+            rows.append(
+                {
+                    "game_id": game["game_id"],
+                    "game_date": game["game_date"],
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "target_home_win": int(game["winner_team"] == home_team),
+                    **_build_game_features(
+                        home_snapshot,
+                        away_snapshot,
+                        home_pitching,
+                        away_pitching,
+                        game_date=game_date,
+                        is_doubleheader=is_doubleheader,
+                        market_home_implied_prob=_market_home_implied_prob(market_prior_lookup.get(game["game_id"])),
+                        home_offense_vs_opp_hand=home_offense_vs_opp_hand,
+                        away_offense_vs_opp_hand=away_offense_vs_opp_hand,
+                    ),
+                }
+            )
+
+        _update_histories(
+            game,
+            pitching_lookup,
+            batting_lookup,
+            team_history,
+            pitcher_history,
+            team_pitching_history,
+            team_offense_hand_history,
+        )
+        _update_elo(game, elo_ratings)
+
+    return pd.DataFrame(rows)
+
+
+def train_game_outcome_model(training_df: pd.DataFrame) -> dict[str, object]:
+    if training_df.empty:
+        raise ValueError("Training dataset is empty.")
+    if training_df["target_home_win"].nunique() < 2:
+        raise ValueError("Training dataset must contain both classes.")
+
+    train_df, valid_df = _split_training_data(training_df)
+    candidate_models = _fit_candidate_models(train_df)
+    candidate_metrics = {
+        model_name: _classification_metrics(valid_df["target_home_win"], pipeline.predict_proba(valid_df[FEATURE_COLUMNS])[:, 1])
+        for model_name, pipeline in candidate_models.items()
+    }
+    selected_model_name = _select_model(candidate_metrics)
+    selected_pipeline = candidate_models[selected_model_name]
+    bayes_bundle = _train_bayesian_bundle(train_df)
+    benchmarks = benchmark_game_outcome_models(train_df, valid_df, candidate_models)
+    selected_metrics = dict(candidate_metrics[selected_model_name])
+    selected_metrics["rows_train"] = int(len(train_df))
+    selected_metrics["rows_valid"] = int(len(valid_df))
+
+    mlflow.set_tracking_uri(settings().mlflow_tracking_uri)
+    with mlflow.start_run(run_name=selected_model_name):
+        mlflow.log_params(
+            {
+                "selected_model": selected_model_name,
+                "target": "home_win",
+                "features": ",".join(FEATURE_COLUMNS),
+            }
+        )
+        for model_name, metrics in candidate_metrics.items():
+            prefix = model_name.replace("-", "_")
+            mlflow.log_metrics({f"{prefix}_{key}": value for key, value in metrics.items()})
+        try:
+            mlflow.sklearn.log_model(selected_pipeline, "model")
+        except PermissionError:
+            pass
+
+    return {
+        "model_name": selected_model_name,
+        "feature_columns": FEATURE_COLUMNS,
+        "trained_on_start_date": train_df["game_date"].min().date().isoformat(),
+        "trained_on_end_date": valid_df["game_date"].max().date().isoformat(),
+        "metrics": selected_metrics,
+        "candidate_metrics": candidate_metrics,
+        "benchmarks": benchmarks,
+        "pipeline": selected_pipeline,
+        "bayes_model_name": BAYES_MODEL_NAME,
+        "bayes_base_rate": bayes_bundle["base_rate"],
+        "bayes_evidence_pipeline": bayes_bundle["pipeline"],
+        "bayes_evidence_feature_columns": BAYES_EVIDENCE_FEATURE_COLUMNS,
+        "bayes_prior_default": 0.5,
+    }
+
+
+def train_and_save_model(start_date: str, end_date: str, path: Path | None = None) -> dict[str, object]:
+    results_df, pitching_logs_df, batting_logs_df, market_priors_df = fetch_training_inputs(start_date, end_date)
+    training_df = build_training_dataset(results_df, pitching_logs_df, batting_logs_df=batting_logs_df, market_priors_df=market_priors_df)
+    bundle = train_game_outcome_model(training_df)
+    saved_path = save_trained_model(bundle, path=path)
+    return {"bundle": bundle, "path": saved_path, "rows": len(training_df)}
+
+
+def run_model_benchmark(start_date: str, end_date: str) -> dict[str, object]:
+    results_df, pitching_logs_df, batting_logs_df, market_priors_df = fetch_training_inputs(start_date, end_date)
+    training_df = build_training_dataset(results_df, pitching_logs_df, batting_logs_df=batting_logs_df, market_priors_df=market_priors_df)
+    if training_df.empty:
+        return {"status": "insufficient_data", "rows": 0}
+
+    train_df, valid_df = _split_training_data(training_df)
+    candidates = _fit_candidate_models(train_df)
+    benchmark = benchmark_game_outcome_models(train_df, valid_df, candidates)
+    return {
+        "status": "ok",
+        "rows": len(training_df),
+        "rows_train": len(train_df),
+        "rows_valid": len(valid_df),
+        "benchmarks": benchmark["benchmarks"],
+        "calibration": benchmark["calibration"],
+    }
+
+
+def run_forward_feature_selection(start_date: str, end_date: str) -> dict[str, object]:
+    results_df, pitching_logs_df, batting_logs_df, market_priors_df = fetch_training_inputs(start_date, end_date)
+    training_df = build_training_dataset(results_df, pitching_logs_df, batting_logs_df=batting_logs_df, market_priors_df=market_priors_df)
+    if training_df.empty:
+        return {"status": "insufficient_data", "rows": 0}
+    return analyze_forward_feature_selection(training_df)
+
+
+def analyze_forward_feature_selection(training_df: pd.DataFrame) -> dict[str, object]:
+    if training_df.empty:
+        raise ValueError("Training dataset is empty.")
+    if training_df["target_home_win"].nunique() < 2:
+        raise ValueError("Training dataset must contain both classes.")
+
+    train_df, valid_df = _split_training_data(training_df)
+    aic_steps, best_aic = _forward_select_features(train_df, criterion="aic")
+    bic_steps, best_bic = _forward_select_features(train_df, criterion="bic")
+
+    return {
+        "status": "ok",
+        "rows": len(training_df),
+        "rows_train": len(train_df),
+        "rows_valid": len(valid_df),
+        "aic_steps": _serialize_selection_steps(aic_steps, train_df, valid_df),
+        "bic_steps": _serialize_selection_steps(bic_steps, train_df, valid_df),
+        "best_aic_model": _serialize_information_result(best_aic, train_df, valid_df),
+        "best_bic_model": _serialize_information_result(best_bic, train_df, valid_df),
+    }
+
+
+def benchmark_game_outcome_models(
+    train_df: pd.DataFrame,
+    valid_df: pd.DataFrame,
+    trained_models: dict[str, Pipeline] | Pipeline | None = None,
+) -> dict[str, object]:
+    if train_df.empty or valid_df.empty:
+        raise ValueError("Training and validation frames must be non-empty.")
+
+    if trained_models is None:
+        models = _fit_candidate_models(train_df)
+    elif isinstance(trained_models, Pipeline):
+        models = {LOGISTIC_MODEL_NAME: trained_models}
+    else:
+        models = trained_models
+
+    target = valid_df["target_home_win"].astype(int)
+    benchmark_probabilities = {
+        name: pipeline.predict_proba(valid_df[FEATURE_COLUMNS])[:, 1]
+        for name, pipeline in models.items()
+    }
+    bayes_bundle = _train_bayesian_bundle(train_df)
+    benchmark_probabilities[BAYES_MODEL_NAME] = _bayesian_posterior_probabilities(
+        bayes_bundle,
+        valid_df,
+    )
+    home_win_rate = float(train_df["target_home_win"].mean())
+    heuristic_score = (
+        (valid_df["season_win_pct_diff"] * 1.2)
+        + (valid_df["recent_win_pct_diff"] * 0.8)
+        + (valid_df["venue_win_pct_diff"] * 0.6)
+        + (valid_df["run_diff_per_game_diff"] * 0.2)
+        + (valid_df["season_runs_scored_per_game_diff"] * 0.10)
+        + (valid_df["season_runs_allowed_per_game_adv"] * 0.10)
+        + (valid_df["recent_runs_scored_per_game_diff"] * 0.14)
+        + (valid_df["recent_runs_allowed_per_game_adv"] * 0.14)
+        + (valid_df["rest_days_diff"] * 0.05)
+        + (valid_df["venue_streak_diff"] * 0.02)
+        + (valid_df["travel_switch_adv"] * 0.08)
+        - (valid_df["doubleheader_flag"] * 0.05)
+        + (valid_df["streak_diff"] * 0.03)
+        + (valid_df["elo_diff"] / 150.0)
+        + ((valid_df["elo_home_win_prob"] - 0.5) * 1.5)
+        + (valid_df["starter_era_adv"] * 0.12)
+        + (valid_df["starter_whip_adv"] * 0.45)
+        + (valid_df["starter_strikeouts_per_9_diff"] * 0.04)
+        + (valid_df["starter_walks_per_9_adv"] * 0.07)
+        + (valid_df["bullpen_innings_3d_adv"] * 0.015)
+        + (valid_df["bullpen_pitches_3d_adv"] / 5000.0)
+        + (valid_df["relievers_used_3d_adv"] * 0.02)
+    )
+    benchmark_probabilities.update(
+        {
+            "home_win_rate_baseline": np.full(len(valid_df), home_win_rate),
+            "always_home": np.full(len(valid_df), 0.999),
+            "heuristic_feature_score": 1.0 / (1.0 + np.exp(-heuristic_score.to_numpy())),
+        }
+    )
+
+    benchmark_metrics = {
+        name: _classification_metrics(target, probabilities)
+        for name, probabilities in benchmark_probabilities.items()
+    }
+    calibration = pd.concat(
+        [_calibration_table(target, probabilities, model_name) for model_name, probabilities in benchmark_probabilities.items()],
+        ignore_index=True,
+    )
+    return {"benchmarks": benchmark_metrics, "calibration": calibration.to_dict(orient="records")}
+
+
+def build_live_feature_frame(
+    games_df: pd.DataFrame,
+    team_strengths_df: pd.DataFrame,
+    games_with_pitching_df: pd.DataFrame,
+    team_matchups_df: pd.DataFrame | None = None,
+    market_priors_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    if games_df.empty or team_strengths_df.empty:
+        return pd.DataFrame()
+
+    lookup = team_strengths_df.set_index("team").to_dict(orient="index")
+    matchup_lookup = (
+        team_matchups_df.set_index("team").to_dict(orient="index")
+        if team_matchups_df is not None and not team_matchups_df.empty
+        else {}
+    )
+    market_prior_lookup = (
+        market_priors_df.drop_duplicates(subset=["game_id"]).set_index("game_id")["market_home_implied_prob"].to_dict()
+        if market_priors_df is not None and not market_priors_df.empty
+        else {}
+    )
+    rows: list[dict[str, object]] = []
+    for game in games_with_pitching_df.to_dict(orient="records"):
+        home = lookup.get(game["home_team"])
+        away = lookup.get(game["away_team"])
+        if not home or not away:
+            continue
+        if min(home["games_played"], away["games_played"]) < settings().model_min_games:
+            continue
+        home_snapshot = TeamSnapshot(
+            games_played=int(home["games_played"]),
+            season_win_pct=float(home["season_win_pct"]),
+            recent_win_pct=float(home["recent_win_pct"]),
+            venue_win_pct=float(home["home_win_pct"]),
+            run_diff_per_game=float(home["run_diff_per_game"]),
+            season_runs_scored_per_game=float(home.get("season_runs_scored_per_game", 0.0)),
+            season_runs_allowed_per_game=float(home.get("season_runs_allowed_per_game", 0.0)),
+            recent_runs_scored_per_game=float(home.get("recent_runs_scored_per_game", 0.0)),
+            recent_runs_allowed_per_game=float(home.get("recent_runs_allowed_per_game", 0.0)),
+            streak=int(home["streak"]),
+            elo_rating=float(home.get("elo_rating", ELO_BASELINE)),
+            last_game_date=pd.to_datetime(home.get("last_game_date")) if home.get("last_game_date") is not None else None,
+            last_is_home=bool(home.get("last_is_home")) if home.get("last_is_home") is not None else None,
+            current_venue_streak=int(home.get("current_venue_streak", 0)),
+        )
+        away_snapshot = TeamSnapshot(
+            games_played=int(away["games_played"]),
+            season_win_pct=float(away["season_win_pct"]),
+            recent_win_pct=float(away["recent_win_pct"]),
+            venue_win_pct=float(away["away_win_pct"]),
+            run_diff_per_game=float(away["run_diff_per_game"]),
+            season_runs_scored_per_game=float(away.get("season_runs_scored_per_game", 0.0)),
+            season_runs_allowed_per_game=float(away.get("season_runs_allowed_per_game", 0.0)),
+            recent_runs_scored_per_game=float(away.get("recent_runs_scored_per_game", 0.0)),
+            recent_runs_allowed_per_game=float(away.get("recent_runs_allowed_per_game", 0.0)),
+            streak=int(away["streak"]),
+            elo_rating=float(away.get("elo_rating", ELO_BASELINE)),
+            last_game_date=pd.to_datetime(away.get("last_game_date")) if away.get("last_game_date") is not None else None,
+            last_is_home=bool(away.get("last_is_home")) if away.get("last_is_home") is not None else None,
+            current_venue_streak=int(away.get("current_venue_streak", 0)),
+        )
+        home_offense_vs_opp_hand = offense_split_value(
+            matchup_lookup.get(game["home_team"]),
+            game.get("away_pitcher_pitcher_hand") or game.get("away_probable_pitcher_hand"),
+        )
+        away_offense_vs_opp_hand = offense_split_value(
+            matchup_lookup.get(game["away_team"]),
+            game.get("home_pitcher_pitcher_hand") or game.get("home_probable_pitcher_hand"),
+        )
+        game_date = pd.to_datetime(game["game_date"])
+        is_doubleheader = bool(game.get("game_number") and int(game.get("game_number")) > 1) or str(game.get("doubleheader", "")).upper() not in {"", "N"}
+        rows.append(
+            {
+                "game_id": game["game_id"],
+                "snapshot_ts": game["snapshot_ts"],
+                "home_team": game["home_team"],
+                "away_team": game["away_team"],
+                **_build_game_features(
+                    home_snapshot,
+                    away_snapshot,
+                    _live_pitching_context(game, "home"),
+                    _live_pitching_context(game, "away"),
+                    game_date=game_date,
+                    is_doubleheader=is_doubleheader,
+                    market_home_implied_prob=_market_home_implied_prob(market_prior_lookup.get(game["game_id"])),
+                    home_offense_vs_opp_hand=home_offense_vs_opp_hand,
+                    away_offense_vs_opp_hand=away_offense_vs_opp_hand,
+                ),
+                "home_season_win_pct": home_snapshot.season_win_pct,
+                "away_season_win_pct": away_snapshot.season_win_pct,
+                "home_recent_win_pct": home_snapshot.recent_win_pct,
+                "away_recent_win_pct": away_snapshot.recent_win_pct,
+                "home_venue_win_pct": home_snapshot.venue_win_pct,
+                "away_venue_win_pct": away_snapshot.venue_win_pct,
+                "home_run_diff_per_game": home_snapshot.run_diff_per_game,
+                "away_run_diff_per_game": away_snapshot.run_diff_per_game,
+                "home_season_runs_scored_per_game": home_snapshot.season_runs_scored_per_game,
+                "away_season_runs_scored_per_game": away_snapshot.season_runs_scored_per_game,
+                "home_season_runs_allowed_per_game": home_snapshot.season_runs_allowed_per_game,
+                "away_season_runs_allowed_per_game": away_snapshot.season_runs_allowed_per_game,
+                "home_recent_runs_scored_per_game": home_snapshot.recent_runs_scored_per_game,
+                "away_recent_runs_scored_per_game": away_snapshot.recent_runs_scored_per_game,
+                "home_recent_runs_allowed_per_game": home_snapshot.recent_runs_allowed_per_game,
+                "away_recent_runs_allowed_per_game": away_snapshot.recent_runs_allowed_per_game,
+                "home_rest_days": _rest_days_before_game(home_snapshot.last_game_date, game_date),
+                "away_rest_days": _rest_days_before_game(away_snapshot.last_game_date, game_date),
+                "home_venue_streak": _venue_streak_before_game(home_snapshot, venue_home=True),
+                "away_venue_streak": _venue_streak_before_game(away_snapshot, venue_home=False),
+                "home_travel_switch": _travel_switch_before_game(home_snapshot, venue_home=True),
+                "away_travel_switch": _travel_switch_before_game(away_snapshot, venue_home=False),
+                "is_doubleheader": is_doubleheader,
+                "home_streak": home_snapshot.streak,
+                "away_streak": away_snapshot.streak,
+                "home_elo_rating": home_snapshot.elo_rating,
+                "away_elo_rating": away_snapshot.elo_rating,
+                "home_starter_era": game.get("home_pitcher_era"),
+                "away_starter_era": game.get("away_pitcher_era"),
+                "home_starter_whip": game.get("home_pitcher_whip"),
+                "away_starter_whip": game.get("away_pitcher_whip"),
+                "home_starter_strikeouts_per_9": game.get("home_pitcher_strikeouts_per_9"),
+                "away_starter_strikeouts_per_9": game.get("away_pitcher_strikeouts_per_9"),
+                "home_starter_walks_per_9": game.get("home_pitcher_walks_per_9"),
+                "away_starter_walks_per_9": game.get("away_pitcher_walks_per_9"),
+                "home_bullpen_innings_3d": game.get("home_bullpen_innings_3d"),
+                "away_bullpen_innings_3d": game.get("away_bullpen_innings_3d"),
+                "home_bullpen_pitches_3d": game.get("home_bullpen_pitches_3d"),
+                "away_bullpen_pitches_3d": game.get("away_bullpen_pitches_3d"),
+                "home_relievers_used_3d": game.get("home_relievers_used_3d"),
+                "away_relievers_used_3d": game.get("away_relievers_used_3d"),
+                "market_home_implied_prob": _market_home_implied_prob(market_prior_lookup.get(game["game_id"])),
+                "home_offense_vs_opp_starter_hand": home_offense_vs_opp_hand,
+                "away_offense_vs_opp_starter_hand": away_offense_vs_opp_hand,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def predict_home_win_probabilities(bundle: dict[str, object], features_df: pd.DataFrame) -> pd.DataFrame:
+    if features_df.empty:
+        return pd.DataFrame()
+    result = features_df.copy()
+    if bundle.get("bayes_evidence_pipeline") is not None and bundle.get("bayes_base_rate") is not None:
+        result["home_win_prob"] = _bayesian_posterior_probabilities(bundle, result)
+        result["model_name"] = str(bundle.get("bayes_model_name", BAYES_MODEL_NAME))
+    else:
+        result["home_win_prob"] = bundle["pipeline"].predict_proba(result[FEATURE_COLUMNS])[:, 1]
+        result["model_name"] = bundle["model_name"]
+    return result
+
+
+def _fit_candidate_models(train_df: pd.DataFrame) -> dict[str, Pipeline]:
+    models = {
+        LOGISTIC_MODEL_NAME: _build_logistic_pipeline(),
+        HISTGB_MODEL_NAME: _build_histgb_pipeline(),
+        KNN_MODEL_NAME: _build_knn_pipeline(),
+        SVM_MODEL_NAME: _build_svm_pipeline(),
+    }
+    for pipeline in models.values():
+        pipeline.fit(train_df[FEATURE_COLUMNS], train_df["target_home_win"])
+    return models
+
+
+def _train_bayesian_bundle(train_df: pd.DataFrame) -> dict[str, object]:
+    base_rate = float(np.clip(train_df["target_home_win"].mean(), 1e-6, 1 - 1e-6))
+    pipeline = _build_logistic_pipeline(BAYES_EVIDENCE_FEATURE_COLUMNS)
+    pipeline.fit(train_df[BAYES_EVIDENCE_FEATURE_COLUMNS], train_df["target_home_win"])
+    return {"pipeline": pipeline, "base_rate": base_rate}
+
+
+def _bayesian_posterior_probabilities(bundle: dict[str, object], frame: pd.DataFrame) -> np.ndarray:
+    evidence_pipeline = bundle["bayes_evidence_pipeline"] if "bayes_evidence_pipeline" in bundle else bundle["pipeline"]
+    evidence_columns = bundle.get("bayes_evidence_feature_columns", BAYES_EVIDENCE_FEATURE_COLUMNS)
+    evidence_probabilities = np.clip(
+        evidence_pipeline.predict_proba(frame[evidence_columns])[:, 1],
+        1e-6,
+        1 - 1e-6,
+    )
+    base_rate = float(np.clip(bundle.get("bayes_base_rate", 0.5), 1e-6, 1 - 1e-6))
+    prior_probabilities = np.clip(_bayesian_prior_probabilities(frame, default=bundle.get("bayes_prior_default", 0.5)), 1e-6, 1 - 1e-6)
+
+    base_rate_odds = base_rate / (1.0 - base_rate)
+    evidence_odds = evidence_probabilities / (1.0 - evidence_probabilities)
+    likelihood_ratio = evidence_odds / base_rate_odds
+    posterior_odds = (prior_probabilities / (1.0 - prior_probabilities)) * likelihood_ratio
+    posterior = posterior_odds / (1.0 + posterior_odds)
+    return np.clip(posterior, 1e-6, 1 - 1e-6)
+
+
+def _bayesian_prior_probabilities(frame: pd.DataFrame, default: float = 0.5) -> np.ndarray:
+    market_prior = np.clip(frame["market_home_implied_prob"].to_numpy(dtype=float), 1e-6, 1 - 1e-6)
+    neutral_mask = np.isclose(market_prior, default, atol=1e-9)
+    if "elo_home_win_prob" not in frame.columns:
+        return market_prior
+    elo_prior = np.clip(frame["elo_home_win_prob"].to_numpy(dtype=float), 1e-6, 1 - 1e-6)
+    return np.where(neutral_mask, elo_prior, market_prior)
+
+
+def _forward_select_features(
+    train_df: pd.DataFrame,
+    criterion: str,
+) -> tuple[list[InformationCriteriaResult], InformationCriteriaResult]:
+    if criterion not in {"aic", "bic"}:
+        raise ValueError("criterion must be 'aic' or 'bic'.")
+
+    selected_features: list[str] = []
+    remaining_features = list(FEATURE_COLUMNS)
+    steps: list[InformationCriteriaResult] = []
+    best_result: InformationCriteriaResult | None = None
+    best_score = np.inf
+
+    while remaining_features:
+        candidate_results = []
+        for candidate in remaining_features:
+            features = [*selected_features, candidate]
+            result = _fit_information_criteria_model(train_df, features)
+            candidate_results.append(result)
+
+        winning_result = min(candidate_results, key=lambda item: getattr(item, criterion))
+        winning_score = getattr(winning_result, criterion)
+        if winning_score >= best_score:
+            break
+
+        selected_features = list(winning_result.features)
+        remaining_features = [feature for feature in remaining_features if feature not in selected_features]
+        steps.append(winning_result)
+        best_result = winning_result
+        best_score = winning_score
+
+    if best_result is None:
+        raise ValueError("Unable to fit any forward-selection models.")
+    return steps, best_result
+
+
+def _fit_information_criteria_model(
+    train_df: pd.DataFrame,
+    feature_columns: list[str],
+) -> InformationCriteriaResult:
+    pipeline = _build_selection_pipeline(feature_columns)
+    target = train_df["target_home_win"].astype(int)
+    pipeline.fit(train_df[feature_columns], target)
+    probabilities = pipeline.predict_proba(train_df[feature_columns])[:, 1]
+    log_likelihood = _log_likelihood(target, probabilities)
+    parameter_count = len(feature_columns) + 1
+    sample_size = len(train_df)
+    return InformationCriteriaResult(
+        features=tuple(feature_columns),
+        log_likelihood=log_likelihood,
+        aic=(2.0 * parameter_count) - (2.0 * log_likelihood),
+        bic=(np.log(sample_size) * parameter_count) - (2.0 * log_likelihood),
+        metrics=_classification_metrics(target, probabilities),
+    )
+
+
+def _build_selection_pipeline(feature_columns: list[str]) -> Pipeline:
+    return Pipeline(
+        steps=[
+            (
+                "preprocess",
+                ColumnTransformer(
+                    transformers=[
+                        (
+                            "numeric",
+                            Pipeline(
+                                steps=[
+                                    ("impute", SimpleImputer(strategy="median")),
+                                    ("scale", StandardScaler()),
+                                ]
+                            ),
+                            feature_columns,
+                        )
+                    ]
+                ),
+            ),
+            ("classifier", LogisticRegression(max_iter=1000, C=np.inf)),
+        ]
+    )
+
+
+def _serialize_selection_steps(
+    steps: list[InformationCriteriaResult],
+    train_df: pd.DataFrame,
+    valid_df: pd.DataFrame,
+) -> list[dict[str, object]]:
+    return [
+        {
+            "step": index,
+            **_serialize_information_result(step_result, train_df, valid_df),
+        }
+        for index, step_result in enumerate(steps, start=1)
+    ]
+
+
+def _serialize_information_result(
+    result: InformationCriteriaResult,
+    train_df: pd.DataFrame,
+    valid_df: pd.DataFrame,
+) -> dict[str, object]:
+    validation_metrics = _evaluate_feature_subset(train_df, valid_df, list(result.features))
+    return {
+        "features": list(result.features),
+        "feature_count": len(result.features),
+        "log_likelihood": result.log_likelihood,
+        "aic": result.aic,
+        "bic": result.bic,
+        "train_metrics": result.metrics,
+        "valid_metrics": validation_metrics,
+    }
+
+
+def _evaluate_feature_subset(
+    train_df: pd.DataFrame,
+    valid_df: pd.DataFrame,
+    feature_columns: list[str],
+) -> dict[str, float]:
+    if valid_df.empty:
+        return {}
+    pipeline = _build_selection_pipeline(feature_columns)
+    train_target = train_df["target_home_win"].astype(int)
+    target = valid_df["target_home_win"].astype(int)
+    pipeline.fit(train_df[feature_columns], train_target)
+    probabilities = pipeline.predict_proba(valid_df[feature_columns])[:, 1]
+    return _classification_metrics(target, probabilities)
+
+
+def _build_logistic_pipeline(feature_columns: list[str] | None = None) -> Pipeline:
+    columns = feature_columns or FEATURE_COLUMNS
+    return Pipeline(
+        steps=[
+            (
+                "preprocess",
+                ColumnTransformer(
+                    transformers=[
+                        (
+                            "numeric",
+                            Pipeline(
+                                steps=[
+                                      ("impute", SimpleImputer(strategy="median")),
+                                      ("scale", StandardScaler()),
+                                  ]
+                              ),
+                              columns,
+                          )
+                      ]
+                  ),
+              ),
+              ("classifier", LogisticRegression(max_iter=1000)),
+          ]
+      )
+
+
+def _build_histgb_pipeline() -> Pipeline:
+    return Pipeline(
+        steps=[
+            (
+                "preprocess",
+                ColumnTransformer(
+                    transformers=[
+                        ("numeric", Pipeline(steps=[("impute", SimpleImputer(strategy="median"))]), FEATURE_COLUMNS)
+                    ]
+                ),
+            ),
+            ("classifier", GradientBoostingClassifier(learning_rate=0.05, n_estimators=250, max_depth=3, random_state=42)),
+        ]
+    )
+
+
+def _build_knn_pipeline() -> Pipeline:
+    return Pipeline(
+        steps=[
+            (
+                "preprocess",
+                ColumnTransformer(
+                    transformers=[
+                        (
+                            "numeric",
+                            Pipeline(
+                                steps=[
+                                    ("impute", SimpleImputer(strategy="median")),
+                                    ("scale", StandardScaler()),
+                                ]
+                            ),
+                            FEATURE_COLUMNS,
+                        )
+                    ]
+                ),
+            ),
+            ("classifier", KNeighborsClassifier(n_neighbors=7, weights="distance")),
+        ]
+    )
+
+
+def _build_svm_pipeline() -> Pipeline:
+    return Pipeline(
+        steps=[
+            (
+                "preprocess",
+                ColumnTransformer(
+                    transformers=[
+                        (
+                            "numeric",
+                            Pipeline(
+                                steps=[
+                                    ("impute", SimpleImputer(strategy="median")),
+                                    ("scale", StandardScaler()),
+                                ]
+                            ),
+                            FEATURE_COLUMNS,
+                        )
+                    ]
+                ),
+            ),
+            ("classifier", SVC(kernel="rbf", C=1.0, gamma="scale", probability=True, random_state=42)),
+        ]
+    )
+
+
+def _split_training_data(training_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    ordered = training_df.sort_values(["game_date", "game_id"]).reset_index(drop=True)
+    split_index = int(len(ordered) * 0.8)
+    if split_index <= 0 or split_index >= len(ordered):
+        raise ValueError("Training dataset is too small for a time-based split.")
+    return ordered.iloc[:split_index].copy(), ordered.iloc[split_index:].copy()
+
+
+def _classification_metrics(target: pd.Series, probabilities: np.ndarray | pd.Series) -> dict[str, float]:
+    clipped = np.clip(np.asarray(probabilities, dtype=float), 1e-6, 1 - 1e-6)
+    predictions = (clipped >= 0.5).astype(int)
+    return {
+        "accuracy": float((predictions == target.to_numpy()).mean()),
+        "roc_auc": float(roc_auc_score(target, clipped)),
+        "log_loss": float(log_loss(target, clipped)),
+        "brier_score": float(brier_score_loss(target, clipped)),
+    }
+
+
+def _log_likelihood(target: pd.Series, probabilities: np.ndarray | pd.Series) -> float:
+    clipped = np.clip(np.asarray(probabilities, dtype=float), 1e-6, 1 - 1e-6)
+    target_array = target.to_numpy(dtype=float)
+    return float(np.sum((target_array * np.log(clipped)) + ((1.0 - target_array) * np.log(1.0 - clipped))))
+
+
+def _select_model(candidate_metrics: dict[str, dict[str, float]]) -> str:
+    metric = settings().model_selection_metric.lower().strip()
+    if metric == "accuracy":
+        return max(candidate_metrics, key=lambda name: (candidate_metrics[name]["accuracy"], candidate_metrics[name]["roc_auc"]))
+    if metric == "roc_auc":
+        return max(candidate_metrics, key=lambda name: (candidate_metrics[name]["roc_auc"], candidate_metrics[name]["accuracy"]))
+    if metric == "brier_score":
+        return min(candidate_metrics, key=lambda name: (candidate_metrics[name]["brier_score"], -candidate_metrics[name]["roc_auc"]))
+    return min(candidate_metrics, key=lambda name: (candidate_metrics[name]["log_loss"], -candidate_metrics[name]["roc_auc"]))
+
+
+def _calibration_table(target: pd.Series, probabilities: np.ndarray, model_name: str, bins: int = 5) -> pd.DataFrame:
+    frame = pd.DataFrame({"target": target.to_numpy(), "predicted_prob": np.clip(probabilities, 1e-6, 1 - 1e-6)})
+    frame["bucket"] = pd.cut(frame["predicted_prob"], bins=np.linspace(0, 1, bins + 1), include_lowest=True)
+    calibration = (
+        frame.groupby("bucket", observed=False)
+        .agg(rows=("target", "size"), avg_predicted_prob=("predicted_prob", "mean"), actual_home_win_rate=("target", "mean"))
+        .reset_index()
+    )
+    calibration["model_name"] = model_name
+    calibration["bucket"] = calibration["bucket"].astype(str)
+    return calibration
+
+
+def _build_game_features(
+    home_snapshot: TeamSnapshot,
+    away_snapshot: TeamSnapshot,
+    home_pitching: dict[str, float | None],
+    away_pitching: dict[str, float | None],
+    game_date: pd.Timestamp,
+    is_doubleheader: bool,
+    market_home_implied_prob: float,
+    home_offense_vs_opp_hand: float,
+    away_offense_vs_opp_hand: float,
+) -> dict[str, float]:
+    elo_diff = home_snapshot.elo_rating - away_snapshot.elo_rating
+    elo_home_win_prob = _elo_win_prob(home_snapshot.elo_rating, away_snapshot.elo_rating)
+    home_rest_days = _rest_days_before_game(home_snapshot.last_game_date, game_date)
+    away_rest_days = _rest_days_before_game(away_snapshot.last_game_date, game_date)
+    home_venue_streak = _venue_streak_before_game(home_snapshot, venue_home=True)
+    away_venue_streak = _venue_streak_before_game(away_snapshot, venue_home=False)
+    home_travel_switch = _travel_switch_before_game(home_snapshot, venue_home=True)
+    away_travel_switch = _travel_switch_before_game(away_snapshot, venue_home=False)
+    return {
+        "season_win_pct_diff": home_snapshot.season_win_pct - away_snapshot.season_win_pct,
+        "recent_win_pct_diff": home_snapshot.recent_win_pct - away_snapshot.recent_win_pct,
+        "venue_win_pct_diff": home_snapshot.venue_win_pct - away_snapshot.venue_win_pct,
+        "run_diff_per_game_diff": home_snapshot.run_diff_per_game - away_snapshot.run_diff_per_game,
+        "season_runs_scored_per_game_diff": home_snapshot.season_runs_scored_per_game - away_snapshot.season_runs_scored_per_game,
+        "season_runs_allowed_per_game_adv": away_snapshot.season_runs_allowed_per_game - home_snapshot.season_runs_allowed_per_game,
+        "recent_runs_scored_per_game_diff": home_snapshot.recent_runs_scored_per_game - away_snapshot.recent_runs_scored_per_game,
+        "recent_runs_allowed_per_game_adv": away_snapshot.recent_runs_allowed_per_game - home_snapshot.recent_runs_allowed_per_game,
+        "rest_days_diff": home_rest_days - away_rest_days,
+        "venue_streak_diff": home_venue_streak - away_venue_streak,
+        "travel_switch_adv": away_travel_switch - home_travel_switch,
+        "doubleheader_flag": float(is_doubleheader),
+        "streak_diff": float(home_snapshot.streak - away_snapshot.streak),
+        "elo_diff": elo_diff,
+        "elo_home_win_prob": elo_home_win_prob,
+        "market_home_implied_prob": market_home_implied_prob,
+        "offense_vs_starter_hand_diff": home_offense_vs_opp_hand - away_offense_vs_opp_hand,
+        "starter_era_adv": _diff_positive_for_home(away_pitching.get("era"), home_pitching.get("era")),
+        "starter_whip_adv": _diff_positive_for_home(away_pitching.get("whip"), home_pitching.get("whip")),
+        "starter_strikeouts_per_9_diff": _coalesce_float(home_pitching.get("strikeouts_per_9")) - _coalesce_float(away_pitching.get("strikeouts_per_9")),
+        "starter_walks_per_9_adv": _diff_positive_for_home(away_pitching.get("walks_per_9"), home_pitching.get("walks_per_9")),
+        "bullpen_innings_3d_adv": _diff_positive_for_home(away_pitching.get("bullpen_innings_3d"), home_pitching.get("bullpen_innings_3d")),
+        "bullpen_pitches_3d_adv": _diff_positive_for_home(away_pitching.get("bullpen_pitches_3d"), home_pitching.get("bullpen_pitches_3d")),
+        "relievers_used_3d_adv": _diff_positive_for_home(away_pitching.get("relievers_used_3d"), home_pitching.get("relievers_used_3d")),
+    }
+
+
+def _snapshot_team(history: list[dict[str, object]], venue_home: bool, elo_rating: float) -> TeamSnapshot:
+    games_played = len(history)
+    wins = sum(1 for game in history if game["won"])
+    recent = history[-RECENT_GAMES_WINDOW:]
+    recent_wins = sum(1 for game in recent if game["won"])
+    venue_games = [game for game in history if bool(game["is_home"]) is venue_home]
+    venue_wins = sum(1 for game in venue_games if game["won"])
+    run_diff_total = sum(int(game["run_diff"]) for game in history)
+    run_diff_per_game = (run_diff_total / games_played) if games_played else 0.0
+    return TeamSnapshot(
+        games_played=games_played,
+        season_win_pct=_smoothed_win_pct(wins, games_played),
+        recent_win_pct=_smoothed_win_pct(recent_wins, len(recent)),
+        venue_win_pct=_smoothed_win_pct(venue_wins, len(venue_games)),
+        run_diff_per_game=run_diff_per_game,
+        season_runs_scored_per_game=(sum(int(game["runs_for"]) for game in history) / games_played) if games_played else 0.0,
+        season_runs_allowed_per_game=(sum(int(game["runs_against"]) for game in history) / games_played) if games_played else 0.0,
+        recent_runs_scored_per_game=(sum(int(game["runs_for"]) for game in recent) / len(recent)) if recent else 0.0,
+        recent_runs_allowed_per_game=(sum(int(game["runs_against"]) for game in recent) / len(recent)) if recent else 0.0,
+        streak=_current_streak([bool(game["won"]) for game in history]),
+        elo_rating=elo_rating,
+        last_game_date=pd.to_datetime(history[-1]["game_date"]) if history else None,
+        last_is_home=bool(history[-1]["is_home"]) if history else None,
+        current_venue_streak=_current_venue_streak(history),
+    )
+
+
+def _pregame_pitching_context(
+    game_id: str,
+    team: str,
+    pitching_lookup: dict[tuple[str, str], dict[str, object]],
+    pitcher_history: dict[int, list[dict[str, float]]],
+    team_pitching_history: dict[str, list[dict[str, object]]],
+) -> dict[str, float | None]:
+    context = {
+        "era": None,
+        "whip": None,
+        "strikeouts_per_9": None,
+        "walks_per_9": None,
+        "pitcher_hand": None,
+        "bullpen_innings_3d": 0.0,
+        "bullpen_pitches_3d": 0.0,
+        "relievers_used_3d": 0.0,
+    }
+    game_pitching = pitching_lookup.get((game_id, team))
+    if game_pitching is not None:
+        context["pitcher_hand"] = game_pitching.get("starting_pitcher_hand")
+        starter_id = game_pitching.get("starting_pitcher_id")
+        if starter_id is not None and not pd.isna(starter_id):
+            recent_starts = pitcher_history.get(int(starter_id), [])[-STARTER_LOOKBACK_GAMES:]
+            if recent_starts:
+                innings = sum(float(start["innings_pitched"]) for start in recent_starts)
+                earned_runs = sum(float(start["earned_runs"]) for start in recent_starts)
+                hits = sum(float(start["hits"]) for start in recent_starts)
+                walks = sum(float(start["walks"]) for start in recent_starts)
+                strikeouts = sum(float(start["strikeouts"]) for start in recent_starts)
+                if innings > 0:
+                    context["era"] = earned_runs * 9.0 / innings
+                    context["whip"] = (hits + walks) / innings
+                    context["strikeouts_per_9"] = strikeouts * 9.0 / innings
+                    context["walks_per_9"] = walks * 9.0 / innings
+        recent_team_pitching = team_pitching_history.get(team, [])[-3:]
+        if recent_team_pitching:
+            context["bullpen_innings_3d"] = sum(float(item["bullpen_innings"]) for item in recent_team_pitching)
+            context["bullpen_pitches_3d"] = sum(float(item["bullpen_pitches"]) for item in recent_team_pitching)
+            context["relievers_used_3d"] = sum(float(item["relievers_used"]) for item in recent_team_pitching)
+    return context
+
+
+def _live_pitching_context(game: dict[str, object], side: str) -> dict[str, float | None]:
+    return {
+        "era": _optional_float(game.get(f"{side}_pitcher_era")),
+        "whip": _optional_float(game.get(f"{side}_pitcher_whip")),
+        "strikeouts_per_9": _optional_float(game.get(f"{side}_pitcher_strikeouts_per_9")),
+        "walks_per_9": _optional_float(game.get(f"{side}_pitcher_walks_per_9")),
+        "pitcher_hand": game.get(f"{side}_pitcher_pitcher_hand") or game.get(f"{side}_probable_pitcher_hand"),
+        "bullpen_innings_3d": _optional_float(game.get(f"{side}_bullpen_innings_3d")) or 0.0,
+        "bullpen_pitches_3d": _optional_float(game.get(f"{side}_bullpen_pitches_3d")) or 0.0,
+        "relievers_used_3d": _optional_float(game.get(f"{side}_relievers_used_3d")) or 0.0,
+    }
+
+
+def _update_histories(
+    game: dict[str, object],
+    pitching_lookup: dict[tuple[str, str], dict[str, object]],
+    batting_lookup: dict[tuple[str, str], dict[str, object]],
+    team_history: dict[str, list[dict[str, object]]],
+    pitcher_history: dict[int, list[dict[str, float]]],
+    team_pitching_history: dict[str, list[dict[str, object]]],
+    team_offense_hand_history: dict[str, list[dict[str, object]]],
+) -> None:
+    away_won = game["away_score"] > game["home_score"]
+    home_won = game["home_score"] > game["away_score"]
+    team_history.setdefault(game["away_team"], []).append(
+        {
+            "game_id": game["game_id"],
+            "game_date": game["game_date"],
+            "is_home": False,
+            "won": away_won,
+            "run_diff": int(game["away_score"]) - int(game["home_score"]),
+            "runs_for": int(game["away_score"]),
+            "runs_against": int(game["home_score"]),
+        }
+    )
+    team_history.setdefault(game["home_team"], []).append(
+        {
+            "game_id": game["game_id"],
+            "game_date": game["game_date"],
+            "is_home": True,
+            "won": home_won,
+            "run_diff": int(game["home_score"]) - int(game["away_score"]),
+            "runs_for": int(game["home_score"]),
+            "runs_against": int(game["away_score"]),
+        }
+    )
+    for team in (game["away_team"], game["home_team"]):
+        pitching = pitching_lookup.get((game["game_id"], team))
+        if pitching is None:
+            continue
+        starter_id = pitching.get("starting_pitcher_id")
+        if starter_id is not None and not pd.isna(starter_id):
+            pitcher_history.setdefault(int(starter_id), []).append(
+                {
+                    "innings_pitched": _coalesce_float(pitching.get("starter_innings_pitched")),
+                    "earned_runs": _coalesce_float(pitching.get("starter_earned_runs")),
+                    "hits": _coalesce_float(pitching.get("starter_hits")),
+                    "walks": _coalesce_float(pitching.get("starter_walks")),
+                    "strikeouts": _coalesce_float(pitching.get("starter_strikeouts")),
+                }
+            )
+        team_pitching_history.setdefault(team, []).append(
+            {
+                "game_date": game["game_date"],
+                "bullpen_innings": _coalesce_float(pitching.get("bullpen_innings")),
+                "bullpen_pitches": _coalesce_float(pitching.get("bullpen_pitches")),
+                "relievers_used": _coalesce_float(pitching.get("relievers_used")),
+            }
+        )
+    home_pitching = pitching_lookup.get((game["game_id"], game["home_team"]), {})
+    away_pitching = pitching_lookup.get((game["game_id"], game["away_team"]), {})
+    away_batting = batting_lookup.get((game["game_id"], game["away_team"]), {})
+    home_batting = batting_lookup.get((game["game_id"], game["home_team"]), {})
+    team_offense_hand_history.setdefault(game["away_team"], []).append(
+        {
+            "game_date": game["game_date"],
+            "opponent_starter_hand": home_pitching.get("starting_pitcher_hand"),
+            "offense_score": offense_score_from_stats(away_batting),
+        }
+    )
+    team_offense_hand_history.setdefault(game["home_team"], []).append(
+        {
+            "game_date": game["game_date"],
+            "opponent_starter_hand": away_pitching.get("starting_pitcher_hand"),
+            "offense_score": offense_score_from_stats(home_batting),
+        }
+    )
+
+
+def _update_elo(game: dict[str, object], elo_ratings: dict[str, float]) -> None:
+    away_team = game["away_team"]
+    home_team = game["home_team"]
+    away_elo = elo_ratings.get(away_team, ELO_BASELINE)
+    home_elo = elo_ratings.get(home_team, ELO_BASELINE)
+    home_expected = _elo_win_prob(home_elo, away_elo)
+    home_actual = 1.0 if game["home_score"] > game["away_score"] else 0.0
+    away_actual = 1.0 - home_actual
+    elo_ratings[home_team] = home_elo + ELO_K_FACTOR * (home_actual - home_expected)
+    elo_ratings[away_team] = away_elo + ELO_K_FACTOR * (away_actual - (1.0 - home_expected))
+
+
+def _elo_win_prob(rating_a: float, rating_b: float) -> float:
+    return 1.0 / (1.0 + 10 ** ((rating_b - rating_a) / 400.0))
+
+
+def _rest_days_before_game(last_game_date: pd.Timestamp | None, game_date: pd.Timestamp) -> float:
+    if last_game_date is None or pd.isna(last_game_date):
+        return 0.0
+    return float(max((game_date.normalize() - pd.Timestamp(last_game_date).normalize()).days - 1, 0))
+
+
+def _current_venue_streak(history: list[dict[str, object]]) -> int:
+    if not history:
+        return 0
+    last_is_home = bool(history[-1]["is_home"])
+    streak = 0
+    for game in reversed(history):
+        if bool(game["is_home"]) != last_is_home:
+            break
+        streak += 1
+    return streak
+
+
+def _venue_streak_before_game(snapshot: TeamSnapshot, venue_home: bool) -> float:
+    if snapshot.last_is_home is None:
+        return 0.0
+    return float(snapshot.current_venue_streak if snapshot.last_is_home == venue_home else 0)
+
+
+def _travel_switch_before_game(snapshot: TeamSnapshot, venue_home: bool) -> float:
+    if snapshot.last_is_home is None:
+        return 0.0
+    return float(snapshot.last_is_home != venue_home)
+
+
+def _team_games_on_date(history: list[dict[str, object]], game_date: pd.Timestamp) -> int:
+    normalized = game_date.normalize()
+    return sum(1 for game in history if pd.Timestamp(game["game_date"]).normalize() == normalized)
+
+
+def _smoothed_win_pct(wins: int, games: int) -> float:
+    return (wins + 1) / (games + 2)
+
+
+def _current_streak(results: list[bool]) -> int:
+    if not results:
+        return 0
+    latest = results[-1]
+    streak = 0
+    for result in reversed(results):
+        if result != latest:
+            break
+        streak += 1
+    return streak if latest else -streak
+
+
+def _coalesce_float(value: object) -> float:
+    if value is None or pd.isna(value):
+        return 0.0
+    return float(value)
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    return float(value)
+
+
+def _diff_positive_for_home(away_value: object, home_value: object) -> float:
+    return _coalesce_float(away_value) - _coalesce_float(home_value)
+
+
+def _offense_vs_hand_before_game(history: list[dict[str, object]], pitcher_hand: object) -> float:
+    if not history:
+        return OFFENSE_SPLIT_PRIOR
+    hand = "L" if str(pitcher_hand).strip().upper().startswith("L") else "R"
+    matching = [
+        float(item["offense_score"])
+        for item in history
+        if str(item.get("opponent_starter_hand", "")).strip().upper().startswith(hand)
+    ]
+    if not matching:
+        return OFFENSE_SPLIT_PRIOR
+    return float((sum(matching) + (OFFENSE_SPLIT_PRIOR * 10.0)) / (len(matching) + 10.0))
+
+
+def _market_home_implied_prob(value: object) -> float:
+    if value is None or pd.isna(value):
+        return 0.5
+    return float(min(max(value, 1e-6), 1 - 1e-6))
+
+
+def _load_historical_market_priors(start_date: str, end_date: str) -> pd.DataFrame:
+    db_path = settings().duckdb_path
+    if not db_path.exists():
+        return pd.DataFrame(columns=["game_id", "market_home_implied_prob", "market_source_count"])
+
+    conn = connect(db_path)
+    try:
+        return query_dataframe(
+            conn,
+            f"""
+            SELECT
+                q.game_id,
+                AVG(CASE WHEN q.outcome_team = g.home_team THEN q.fair_prob END) AS market_home_implied_prob,
+                COUNT(DISTINCT q.source) AS market_source_count
+            FROM normalized_quotes_deduped q
+            JOIN games_deduped g ON g.game_id = q.game_id
+            WHERE g.game_date BETWEEN DATE '{start_date}' AND DATE '{end_date}'
+              AND q.is_valid = TRUE
+              AND q.is_pregame = TRUE
+            GROUP BY q.game_id
+            HAVING AVG(CASE WHEN q.outcome_team = g.home_team THEN q.fair_prob END) IS NOT NULL
+            """
+        )
+    finally:
+        conn.close()
