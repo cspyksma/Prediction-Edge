@@ -2,6 +2,7 @@
 __pycache__/
 .pytest_cache/
 pytest-cache-files-*/
+.playwright-mcp/
 .mypy_cache/
 .coverage
 htmlcov/

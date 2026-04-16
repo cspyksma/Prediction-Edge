@@ -192,3 +192,18 @@ Raw payloads are written under `data/raw/` and historical payloads under `data/r
 - If no trained artifact exists yet, the collector falls back to the heuristic baseline so collection still runs.
 - The richer benchmark path trains multiple model families; set `MODEL_SELECTION_METRIC=accuracy` in `.env` if you want to prefer winner-pick accuracy over calibrated probabilities.
 - Accuracy alone is not the main target. The project is also trying to identify model/market probability gaps that may be profitable.
+
+## Public Release Checklist
+
+- Keep `.env`, `data/*.duckdb`, raw payloads, artifacts, MLflow runs, and temp/cache directories out of Git.
+- Review `.gitignore` before pushing any new local data collection outputs.
+- Treat the repo as code-only by default; do not publish collected market snapshots or databases unless you explicitly intend to.
+- Re-run the test suite before pushing significant changes:
+
+```bash
+python -m pytest tests
+```
+
+## License
+
+This project is released under the MIT License. See [LICENSE](LICENSE).
