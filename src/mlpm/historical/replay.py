@@ -2,21 +2,31 @@ from __future__ import annotations
 
 from typing import Any
 
+import pandas as pd
+
 from mlpm.config.settings import settings
 from mlpm.storage.duckdb import connect_read_only, query_dataframe
 
 
-def load_kalshi_pregame_replay(start_date: str, end_date: str):
+def load_kalshi_pregame_replay(start_date: str, end_date: str, games_df: pd.DataFrame | None = None):
     conn = connect_read_only(settings().duckdb_path)
     try:
+        if games_df is not None:
+            games = games_df[["game_id", "game_date", "event_start_time", "home_team", "away_team"]].copy()
+            conn.register("replay_games", games)
+            games_source = "replay_games"
+            date_filter = f"CAST(g.game_date AS DATE) BETWEEN DATE '{start_date}' AND DATE '{end_date}'"
+        else:
+            games_source = "games_deduped"
+            date_filter = f"CAST(g.game_date AS DATE) BETWEEN DATE '{start_date}' AND DATE '{end_date}'"
         return query_dataframe(
             conn,
             f"""
             WITH ranked AS (
                 SELECT
                     q.game_id,
-                    g.game_date,
-                    COALESCE(q.event_start_time, g.event_start_time) AS event_start_time,
+                    CAST(g.game_date AS DATE) AS game_date,
+                    COALESCE(q.event_start_time, CAST(g.event_start_time AS TIMESTAMP)) AS event_start_time,
                     q.quote_ts,
                     q.ticker,
                     q.market_id,
@@ -30,14 +40,14 @@ def load_kalshi_pregame_replay(start_date: str, end_date: str):
                         ORDER BY q.quote_ts DESC, q.imported_at DESC
                     ) AS rn
                 FROM historical_kalshi_quotes q
-                JOIN games_deduped g
+                JOIN {games_source} g
                   ON q.game_id = g.game_id
-                WHERE g.game_date BETWEEN DATE '{start_date}' AND DATE '{end_date}'
+                WHERE {date_filter}
                   AND q.game_id IS NOT NULL
                   AND q.outcome_team IS NOT NULL
                   AND q.home_implied_prob IS NOT NULL
-                  AND COALESCE(q.pre_pitch_flag, q.quote_ts < COALESCE(q.event_start_time, g.event_start_time)) = TRUE
-                  AND q.quote_ts <= COALESCE(q.event_start_time, g.event_start_time)
+                  AND COALESCE(q.pre_pitch_flag, q.quote_ts < COALESCE(q.event_start_time, CAST(g.event_start_time AS TIMESTAMP))) = TRUE
+                  AND q.quote_ts <= COALESCE(q.event_start_time, CAST(g.event_start_time AS TIMESTAMP))
             ),
             selected AS (
                 SELECT *
@@ -71,6 +81,8 @@ def load_kalshi_pregame_replay(start_date: str, end_date: str):
             """
         )
     finally:
+        if games_df is not None:
+            conn.unregister("replay_games")
         conn.close()
 
 

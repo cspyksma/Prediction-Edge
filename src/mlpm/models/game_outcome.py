@@ -287,11 +287,11 @@ def run_historical_kalshi_backtest(start_date: str, end_date: str) -> dict[str, 
     from mlpm.evaluation.strategy import build_bet_opportunities
     from mlpm.historical.replay import build_kalshi_replay_quote_rows, load_kalshi_pregame_replay
 
-    replay_df = load_kalshi_pregame_replay(start_date, end_date)
+    results_df = fetch_final_results(start_date, end_date)
+    replay_df = load_kalshi_pregame_replay(start_date, end_date, games_df=results_df)
     if replay_df.empty:
         return {"status": "insufficient_data", "rows": 0, "message": "No replay-selected Kalshi pregame quotes found."}
 
-    results_df = fetch_final_results(start_date, end_date)
     pitching_logs_df = fetch_game_pitching_logs(start_date, end_date)
     batting_logs_df = fetch_game_batting_logs(start_date, end_date)
     market_priors_df = replay_df[["game_id", "home_market_prob"]].rename(columns={"home_market_prob": "market_home_implied_prob"})
