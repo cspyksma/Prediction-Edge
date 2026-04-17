@@ -20,7 +20,7 @@ from mlpm.historical.normalize_kalshi_history import normalize_kalshi_candle_pay
 from mlpm.ingest.kalshi import KALSHI_MLB_GAME_SERIES
 from mlpm.ingest.mlb_stats import fetch_final_results
 from mlpm.normalize.mapping import canonicalize_team_name, team_aliases
-from mlpm.storage.duckdb import connect, replace_dataframe
+from mlpm.storage.duckdb import append_dataframe, connect
 
 KALSHI_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 KALSHI_MARKETS_URL = f"{KALSHI_BASE_URL}/markets"
@@ -250,7 +250,7 @@ def _backfill_kalshi_history_chunk(
                     payload_count += 1
                     trade_path = build_historical_payload_path("kalshi", "trades", row["day_key"], row["ticker"])
                     write_historical_payload(trade_path, trades_payload)
-        _write_historical_kalshi_rows(normalized_rows)
+        _write_historical_kalshi_rows(normalized_rows, games["game_id"].astype(str).tolist())
         games_with_pregame_quotes = len(
             {
                 str(row["game_id"])
@@ -519,18 +519,29 @@ def _resolve_kalshi_outcome_team(market: dict[str, Any], game: dict[str, Any]) -
     return None
 
 
-def _write_historical_kalshi_rows(rows: list[dict]) -> None:
-    if not rows:
+def _write_historical_kalshi_rows(rows: list[dict], game_ids: list[str] | None = None) -> None:
+    if not rows and not game_ids:
         return
-    frame = pd.DataFrame(rows).drop_duplicates(subset=["ticker", "quote_ts", "outcome_team", "quote_type"])
+    frame = pd.DataFrame(rows)
+    if not frame.empty:
+        frame = frame.drop_duplicates(subset=["ticker", "quote_ts", "outcome_team", "quote_type"])
+    unique_game_ids = pd.DataFrame(
+        {"game_id": sorted({str(game_id) for game_id in (game_ids or []) if game_id not in (None, "")})}
+    )
     conn = connect(settings().duckdb_path)
     try:
-        replace_dataframe(
-            conn,
-            "historical_kalshi_quotes",
-            frame,
-            ["ticker", "quote_ts", "outcome_team", "quote_type"],
-        )
+        if not unique_game_ids.empty:
+            conn.register("historical_kalshi_game_ids", unique_game_ids)
+            conn.execute(
+                """
+                DELETE FROM historical_kalshi_quotes AS target
+                USING historical_kalshi_game_ids AS source
+                WHERE target.game_id = source.game_id
+                """
+            )
+            conn.unregister("historical_kalshi_game_ids")
+        if not frame.empty:
+            append_dataframe(conn, "historical_kalshi_quotes", frame)
     finally:
         conn.close()
 
@@ -546,9 +557,8 @@ def _game_window_end_ts(end_date: str) -> int:
 def _market_query_window(row: dict[str, Any], market: dict[str, Any]) -> tuple[int, int]:
     event_start = _parse_market_time(row.get("event_start_time")) or _parse_market_time(market.get("close_time"))
     open_time = _parse_market_time(market.get("open_time"))
-    close_time = _parse_market_time(market.get("close_time"))
     start_dt = open_time or (event_start - pd.Timedelta(days=1) if event_start is not None else None)
-    end_dt = close_time or event_start or start_dt
+    end_dt = event_start or start_dt
     if start_dt is None or end_dt is None:
         raise ValueError(f"Unable to determine Kalshi candle window for ticker {row.get('ticker')}")
     if end_dt < start_dt:
@@ -624,7 +634,6 @@ def _enrich_candidate_with_market(row: dict[str, Any], market: dict[str, Any]) -
     enriched["event_id"] = market.get("event_ticker") or enriched.get("event_id")
     enriched["market_id"] = market.get("ticker") or enriched.get("market_id") or enriched.get("ticker")
     enriched["ticker"] = market.get("ticker") or enriched.get("ticker")
-    enriched["event_start_time"] = market.get("close_time") or enriched.get("event_start_time")
     return enriched
 
 

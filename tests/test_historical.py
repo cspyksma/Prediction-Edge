@@ -4,19 +4,24 @@ from pathlib import Path
 import uuid
 
 import pandas as pd
+import pytest
 
 from mlpm.config.settings import settings
 from mlpm.historical.common import has_successful_import_run, iter_date_windows
 from mlpm.historical.kalshi_backfill import (
     _extract_market_payload,
+    _enrich_candidate_with_market,
     _map_kalshi_market_to_games,
+    _market_query_window,
     _should_use_historical_market,
+    _write_historical_kalshi_rows,
 )
 from mlpm.historical.normalize_kalshi_history import normalize_kalshi_candle_payload
 from mlpm.historical.normalize_polymarket_history import polymarket_history_to_quote_rows
 from mlpm.historical.polymarket_backfill import fetch_polymarket_batch_price_history
 from mlpm.historical.replay import build_kalshi_replay_quote_rows, load_kalshi_pregame_replay
 from mlpm.historical.status import run_historical_import_status
+from mlpm.ingest.mlb_stats import _scheduled_first_pitch_utc
 from mlpm.storage.duckdb import append_dataframe, connect
 
 
@@ -131,6 +136,127 @@ def test_map_kalshi_market_to_games_uses_aliases_and_time_window() -> None:
     assert len(rows) == 1
     assert rows[0]["game_id"] == "g1"
     assert rows[0]["outcome_team"] == "Chicago White Sox"
+
+
+def test_enrich_candidate_keeps_mlb_event_start_time() -> None:
+    row = {
+        "event_id": "evt-1",
+        "market_id": "old-market",
+        "ticker": "old-ticker",
+        "event_start_time": "2026-04-01T17:10:00Z",
+    }
+    market = {
+        "event_ticker": "evt-2",
+        "ticker": "new-ticker",
+        "close_time": "2026-04-01T20:30:00Z",
+    }
+
+    enriched = _enrich_candidate_with_market(row, market)
+
+    assert enriched["event_id"] == "evt-2"
+    assert enriched["ticker"] == "new-ticker"
+    assert enriched["event_start_time"] == "2026-04-01T17:10:00Z"
+
+
+def test_market_query_window_stops_at_first_pitch_not_close() -> None:
+    start_ts, end_ts = _market_query_window(
+        {"ticker": "T1", "event_start_time": "2026-04-01T17:10:00Z"},
+        {"open_time": "2026-03-31T17:10:00Z", "close_time": "2026-04-01T20:30:00Z"},
+    )
+
+    assert start_ts == int(pd.Timestamp("2026-03-31T17:10:00Z").timestamp())
+    assert end_ts == int(pd.Timestamp("2026-04-01T17:10:00Z").timestamp())
+
+
+def test_scheduled_first_pitch_utc_normalizes_game_date() -> None:
+    assert _scheduled_first_pitch_utc({"gameDate": "2026-04-06T22:45:00Z"}) == "2026-04-06T22:45:00Z"
+    assert _scheduled_first_pitch_utc({"gameDate": "2026-04-06T17:45:00-05:00"}) == "2026-04-06T22:45:00Z"
+
+
+def test_write_historical_kalshi_rows_replaces_all_rows_for_game(monkeypatch) -> None:
+    db_path = _workspace_db_path("historical-kalshi-replace")
+    monkeypatch.setenv("DUCKDB_PATH", str(db_path))
+    settings.cache_clear()
+    conn = connect(settings().duckdb_path)
+    append_dataframe(
+        conn,
+        "historical_kalshi_quotes",
+        pd.DataFrame(
+            [
+                {
+                    "import_run_id": "run-old",
+                    "source": "kalshi",
+                    "collection_mode": "historical_import",
+                    "market_id": "m1",
+                    "event_id": "e1",
+                    "ticker": "t1",
+                    "game_id": "g1",
+                    "event_start_time": "2026-04-07T02:10:12Z",
+                    "quote_ts": "2026-04-06T21:04:00Z",
+                    "outcome_team": "Home",
+                    "side": "home",
+                    "home_implied_prob": 0.01,
+                    "raw_prob_yes": 0.01,
+                    "quote_type": "candle_close",
+                    "volume": 1.0,
+                    "open_interest": 1.0,
+                    "best_price_source": "historical_candlesticks",
+                    "pre_pitch_flag": True,
+                    "raw_payload_path": "old.json",
+                    "imported_at": "2026-04-16T12:00:00Z",
+                }
+            ]
+        ),
+    )
+    conn.close()
+
+    _write_historical_kalshi_rows(
+        [
+            {
+                "import_run_id": "run-new",
+                "source": "kalshi",
+                "collection_mode": "historical_import",
+                "market_id": "m1",
+                "event_id": "e1",
+                "ticker": "t1",
+                "game_id": "g1",
+                "event_start_time": "2026-04-06T23:07:00Z",
+                "quote_ts": "2026-04-06T18:00:00Z",
+                "outcome_team": "Home",
+                "side": "home",
+                "home_implied_prob": 0.52,
+                "raw_prob_yes": 0.52,
+                "quote_type": "candle_close",
+                "volume": 1.0,
+                "open_interest": 1.0,
+                "best_price_source": "historical_candlesticks",
+                "pre_pitch_flag": True,
+                "raw_payload_path": "new.json",
+                "imported_at": "2026-04-17T12:00:00Z",
+            }
+        ],
+        ["g1"],
+    )
+
+    conn = connect(settings().duckdb_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT event_start_time, quote_ts, home_implied_prob
+            FROM historical_kalshi_quotes
+            WHERE game_id = 'g1'
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert rows == [
+        (
+            pd.Timestamp("2026-04-06T23:07:00"),
+            pd.Timestamp("2026-04-06T18:00:00"),
+            0.52,
+        )
+    ]
 
 
 def test_polymarket_batch_price_history_rejects_batches_over_20() -> None:
@@ -381,5 +507,69 @@ def test_load_kalshi_pregame_replay_selects_last_pregame_quotes(monkeypatch) -> 
 
     assert len(replay) == 1
     assert replay.iloc[0]["home_market_prob"] == 0.62
-    assert replay.iloc[0]["away_market_prob"] == 0.61
+    assert replay.iloc[0]["away_market_prob"] == pytest.approx(0.38)
+    assert len(quote_rows) == 2
+
+
+def test_load_kalshi_pregame_replay_derives_both_sides_from_single_ticker(monkeypatch) -> None:
+    db_path = _workspace_db_path("historical-replay-single-sided")
+    monkeypatch.setenv("DUCKDB_PATH", str(db_path))
+    settings.cache_clear()
+    conn = connect(settings().duckdb_path)
+    append_dataframe(
+        conn,
+        "games",
+        pd.DataFrame(
+            [
+                {
+                    "game_id": "g2",
+                    "game_date": "2026-04-02",
+                    "event_start_time": "2026-04-02T18:00:00Z",
+                    "away_team": "Away",
+                    "home_team": "Home",
+                    "snapshot_ts": "2026-04-02T12:00:00Z",
+                    "collection_run_ts": "2026-04-02T12:00:00Z",
+                }
+            ]
+        ),
+    )
+    append_dataframe(
+        conn,
+        "historical_kalshi_quotes",
+        pd.DataFrame(
+            [
+                {
+                    "import_run_id": "run-1",
+                    "source": "kalshi",
+                    "collection_mode": "historical_import",
+                    "market_id": "m-away",
+                    "event_id": "e2",
+                    "ticker": "t-away",
+                    "game_id": "g2",
+                    "event_start_time": "2026-04-02T18:00:00Z",
+                    "quote_ts": "2026-04-02T17:30:00Z",
+                    "outcome_team": "Away",
+                    "side": "away",
+                    "home_implied_prob": 0.41,
+                    "raw_prob_yes": 0.59,
+                    "quote_type": "candle_close",
+                    "volume": 1.0,
+                    "open_interest": 1.0,
+                    "best_price_source": "historical_candlesticks",
+                    "pre_pitch_flag": True,
+                    "raw_payload_path": "x",
+                    "imported_at": "2026-04-16T12:00:01Z",
+                }
+            ]
+        ),
+    )
+    conn.close()
+
+    replay = load_kalshi_pregame_replay("2026-04-02", "2026-04-02")
+    quote_rows = build_kalshi_replay_quote_rows(replay)
+
+    assert len(replay) == 1
+    assert replay.iloc[0]["home_market_prob"] == 0.41
+    assert replay.iloc[0]["away_market_prob"] == pytest.approx(0.59)
+    assert replay.iloc[0]["source_rows"] == 1
     assert len(quote_rows) == 2

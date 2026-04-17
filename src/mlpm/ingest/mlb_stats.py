@@ -12,6 +12,19 @@ MLB_BOXSCORE_URL = "https://statsapi.mlb.com/api/v1/game/{game_id}/boxscore"
 MLB_PEOPLE_URL = "https://statsapi.mlb.com/api/v1/people/{player_id}"
 
 
+def _scheduled_first_pitch_utc(game: dict[str, object]) -> str | None:
+    """Return the scheduled MLB first pitch as a normalized UTC timestamp."""
+    for key in ("gameDate", "rescheduleDate", "resumeDate"):
+        value = game.get(key)
+        if value in (None, ""):
+            continue
+        parsed = pd.to_datetime(value, utc=True, errors="coerce")
+        if pd.isna(parsed):
+            continue
+        return parsed.isoformat().replace("+00:00", "Z")
+    return None
+
+
 def fetch_upcoming_games(lookahead_days: int = 3) -> pd.DataFrame:
     start = date.today()
     end = start + timedelta(days=lookahead_days)
@@ -39,7 +52,7 @@ def fetch_upcoming_games(lookahead_days: int = 3) -> pd.DataFrame:
                 {
                     "game_id": str(game["gamePk"]),
                     "game_date": schedule_date["date"],
-                    "event_start_time": game.get("gameDate"),
+                    "event_start_time": _scheduled_first_pitch_utc(game),
                     "away_team": away.get("name"),
                     "home_team": home.get("name"),
                     "away_team_id": away.get("id"),
@@ -101,7 +114,7 @@ def fetch_final_results(start_date: str, end_date: str) -> pd.DataFrame:
                 {
                     "game_id": str(game["gamePk"]),
                     "game_date": schedule_date["date"],
-                    "event_start_time": game.get("gameDate"),
+                    "event_start_time": _scheduled_first_pitch_utc(game),
                     "away_team": away_team,
                     "home_team": home_team,
                     "winner_team": winner,

@@ -46,38 +46,68 @@ def load_kalshi_pregame_replay(start_date: str, end_date: str, games_df: pd.Data
                   AND q.game_id IS NOT NULL
                   AND q.outcome_team IS NOT NULL
                   AND q.home_implied_prob IS NOT NULL
-                  AND COALESCE(q.pre_pitch_flag, q.quote_ts < COALESCE(q.event_start_time, CAST(g.event_start_time AS TIMESTAMP))) = TRUE
                   AND q.quote_ts <= COALESCE(q.event_start_time, CAST(g.event_start_time AS TIMESTAMP))
             ),
             selected AS (
                 SELECT *
                 FROM ranked
                 WHERE rn = 1
+            ),
+            latest_game_quote AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY game_id
+                        ORDER BY quote_ts DESC, home_implied_prob DESC, ticker
+                    ) AS rn
+                FROM selected
+            ),
+            aggregated AS (
+                SELECT
+                    s.game_id,
+                    s.game_date,
+                    s.event_start_time,
+                    MAX(s.quote_ts) AS snapshot_ts,
+                    MAX(CASE WHEN s.outcome_team = s.home_team THEN s.quote_ts END) AS home_quote_ts,
+                    MAX(CASE WHEN s.outcome_team = s.away_team THEN s.quote_ts END) AS away_quote_ts,
+                    s.home_team,
+                    s.away_team,
+                    MAX(CASE WHEN s.outcome_team = s.home_team THEN s.ticker END) AS home_ticker,
+                    MAX(CASE WHEN s.outcome_team = s.away_team THEN s.ticker END) AS away_ticker,
+                    MAX(CASE WHEN s.outcome_team = s.home_team THEN s.market_id END) AS home_market_id,
+                    MAX(CASE WHEN s.outcome_team = s.away_team THEN s.market_id END) AS away_market_id,
+                    MAX(CASE WHEN l.rn = 1 THEN l.home_implied_prob END) AS home_market_prob,
+                    COUNT(*) AS source_rows
+                FROM selected s
+                JOIN latest_game_quote l
+                  ON s.game_id = l.game_id
+                 AND s.game_date = l.game_date
+                 AND s.event_start_time = l.event_start_time
+                 AND s.home_team = l.home_team
+                 AND s.away_team = l.away_team
+                 AND s.quote_ts = l.quote_ts
+                 AND s.ticker = l.ticker
+                GROUP BY s.game_id, s.game_date, s.event_start_time, s.home_team, s.away_team
             )
             SELECT
-                home.game_id,
-                home.game_date,
-                home.event_start_time,
-                GREATEST(home.quote_ts, away.quote_ts) AS snapshot_ts,
-                home.quote_ts AS home_quote_ts,
-                away.quote_ts AS away_quote_ts,
-                home.home_team,
-                home.away_team,
-                home.ticker AS home_ticker,
-                away.ticker AS away_ticker,
-                home.market_id AS home_market_id,
-                away.market_id AS away_market_id,
-                home.home_implied_prob AS home_market_prob,
-                away.home_implied_prob AS away_home_implied_prob,
-                1.0 - away.home_implied_prob AS away_market_prob
-            FROM selected home
-            JOIN selected away
-              ON home.game_id = away.game_id
-             AND home.home_team = away.home_team
-             AND home.away_team = away.away_team
-            WHERE home.outcome_team = home.home_team
-              AND away.outcome_team = away.away_team
-            ORDER BY home.game_date, home.game_id
+                game_id,
+                game_date,
+                event_start_time,
+                snapshot_ts,
+                home_quote_ts,
+                away_quote_ts,
+                home_team,
+                away_team,
+                COALESCE(home_ticker, away_ticker) AS home_ticker,
+                COALESCE(away_ticker, home_ticker) AS away_ticker,
+                COALESCE(home_market_id, away_market_id) AS home_market_id,
+                COALESCE(away_market_id, home_market_id) AS away_market_id,
+                home_market_prob,
+                1.0 - home_market_prob AS away_market_prob,
+                source_rows
+            FROM aggregated
+            WHERE home_market_prob IS NOT NULL
+            ORDER BY game_date, game_id
             """
         )
     finally:
