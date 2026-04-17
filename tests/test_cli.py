@@ -210,6 +210,10 @@ def test_format_historical_backtest_output_includes_roi_metrics() -> None:
             "rows": 20,
             "rows_train": 16,
             "rows_valid": 4,
+            "train_start_date": "2026-03-01",
+            "train_end_date": "2026-03-31",
+            "eval_start_date": "2026-04-01",
+            "eval_end_date": "2026-04-02",
             "replay_rows": 20,
             "valid_replay_rows": 4,
             "champion_model": "mlb_win_bayes_v1",
@@ -221,5 +225,7 @@ def test_format_historical_backtest_output_includes_roi_metrics() -> None:
     )
 
     assert "Historical Kalshi Backtest" in output
+    assert "train_window: 2026-03-01 to 2026-03-31" in output
+    assert "eval_window: 2026-04-01 to 2026-04-02" in output
     assert "champion_model: mlb_win_bayes_v1" in output
     assert "calibration_rows: 1" in output

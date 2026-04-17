@@ -92,9 +92,17 @@ def test_run_historical_kalshi_backtest_reports_roi(monkeypatch) -> None:
         lambda _frame: {"pipeline": DummyPipeline(0.65), "base_rate": 0.5},
     )
 
-    result = run_historical_kalshi_backtest("2026-04-01", "2026-04-05")
+    result = run_historical_kalshi_backtest(
+        train_start_date="2026-04-01",
+        train_end_date="2026-04-04",
+        eval_start_date="2026-04-05",
+        eval_end_date="2026-04-05",
+    )
 
     assert result["status"] == "ok"
+    assert result["rows_train"] == 4
     assert result["rows_valid"] == 1
+    assert result["train_end_date"] == "2026-04-04"
+    assert result["eval_start_date"] == "2026-04-05"
     assert "mlb_win_bayes_v1" in result["benchmarks"]
     assert "roi" in result["benchmarks"]["mlb_win_bayes_v1"]

@@ -283,20 +283,30 @@ def run_model_benchmark(start_date: str, end_date: str) -> dict[str, object]:
     }
 
 
-def run_historical_kalshi_backtest(start_date: str, end_date: str) -> dict[str, object]:
+def run_historical_kalshi_backtest(
+    train_start_date: str,
+    train_end_date: str,
+    eval_start_date: str,
+    eval_end_date: str,
+) -> dict[str, object]:
     from mlpm.evaluation.strategy import build_bet_opportunities
     from mlpm.historical.replay import build_kalshi_replay_quote_rows, load_kalshi_pregame_replay
 
-    results_df = fetch_final_results(start_date, end_date)
-    replay_df = load_kalshi_pregame_replay(start_date, end_date, games_df=results_df)
-    if replay_df.empty:
+    combined_results_df = fetch_final_results(train_start_date, eval_end_date)
+    if combined_results_df.empty:
+        return {"status": "insufficient_data", "rows": 0, "message": "No MLB results found for the combined train/eval window."}
+    replay_df = load_kalshi_pregame_replay(train_start_date, eval_end_date, games_df=combined_results_df)
+    eval_results_df = combined_results_df[
+        pd.to_datetime(combined_results_df["game_date"]).between(pd.Timestamp(eval_start_date), pd.Timestamp(eval_end_date))
+    ].copy()
+    if replay_df.empty or eval_results_df.empty:
         return {"status": "insufficient_data", "rows": 0, "message": "No replay-selected Kalshi pregame quotes found."}
 
-    pitching_logs_df = fetch_game_pitching_logs(start_date, end_date)
-    batting_logs_df = fetch_game_batting_logs(start_date, end_date)
+    pitching_logs_df = fetch_game_pitching_logs(train_start_date, eval_end_date)
+    batting_logs_df = fetch_game_batting_logs(train_start_date, eval_end_date)
     market_priors_df = replay_df[["game_id", "home_market_prob"]].rename(columns={"home_market_prob": "market_home_implied_prob"})
     training_df = build_training_dataset(
-        results_df,
+        combined_results_df,
         pitching_logs_df,
         batting_logs_df=batting_logs_df,
         market_priors_df=market_priors_df,
@@ -304,14 +314,24 @@ def run_historical_kalshi_backtest(start_date: str, end_date: str) -> dict[str, 
     if training_df.empty:
         return {"status": "insufficient_data", "rows": 0, "message": "Training dataset is empty."}
 
-    train_df, valid_df = _split_training_data(training_df)
+    training_dates = pd.to_datetime(training_df["game_date"])
+    train_df = training_df[training_dates.between(pd.Timestamp(train_start_date), pd.Timestamp(train_end_date))].copy()
+    valid_df = training_df[training_dates.between(pd.Timestamp(eval_start_date), pd.Timestamp(eval_end_date))].copy()
+    if train_df.empty:
+        return {"status": "insufficient_data", "rows": 0, "message": "Training dataset is empty for the requested train window."}
+    if valid_df.empty:
+        return {"status": "insufficient_data", "rows": 0, "message": "Evaluation dataset is empty for the requested eval window."}
+
     valid_replay = replay_df[replay_df["game_id"].isin(valid_df["game_id"])].copy()
     if valid_replay.empty:
-        return {"status": "insufficient_data", "rows": 0, "message": "Validation slice has no replay-selected Kalshi quotes."}
+        return {"status": "insufficient_data", "rows": 0, "message": "Evaluation slice has no replay-selected Kalshi quotes."}
+    valid_df = valid_df[valid_df["game_id"].isin(valid_replay["game_id"])].copy()
+    if valid_df.empty:
+        return {"status": "insufficient_data", "rows": 0, "message": "Evaluation feature rows do not overlap replay-selected Kalshi quotes."}
 
     valid_games = valid_replay[["game_id", "game_date", "event_start_time", "home_team", "away_team"]].copy()
     replay_quotes = pd.DataFrame(build_kalshi_replay_quote_rows(valid_replay))
-    results_lookup = results_df.copy()
+    results_lookup = eval_results_df.copy()
     for column in ("away_score", "home_score"):
         if column not in results_lookup.columns:
             results_lookup[column] = None
@@ -403,6 +423,10 @@ def run_historical_kalshi_backtest(start_date: str, end_date: str) -> dict[str, 
         "rows": len(valid_df),
         "rows_train": len(train_df),
         "rows_valid": len(valid_df),
+        "train_start_date": train_start_date,
+        "train_end_date": train_end_date,
+        "eval_start_date": eval_start_date,
+        "eval_end_date": eval_end_date,
         "replay_rows": len(replay_df),
         "valid_replay_rows": len(valid_replay),
         "champion_model": champion_model,

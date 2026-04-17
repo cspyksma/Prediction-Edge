@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from mlpm.backtest.run_backtest import run_backtest
@@ -76,8 +76,12 @@ def _build_parser() -> argparse.ArgumentParser:
     historical_status.add_argument("--end-date", required=True)
 
     historical_backtest = subparsers.add_parser("historical-backtest-kalshi", help="Backtest tabular models against replay-selected Kalshi pregame quotes.")
-    historical_backtest.add_argument("--start-date", required=True)
-    historical_backtest.add_argument("--end-date", required=True)
+    historical_backtest.add_argument("--start-date")
+    historical_backtest.add_argument("--end-date")
+    historical_backtest.add_argument("--train-start-date")
+    historical_backtest.add_argument("--train-end-date")
+    historical_backtest.add_argument("--eval-start-date")
+    historical_backtest.add_argument("--eval-end-date")
 
     backtest = subparsers.add_parser("backtest", help="Run a simple backtest over stored data.")
     backtest.add_argument("--start-date", required=True)
@@ -436,6 +440,8 @@ def _format_historical_backtest_output(result: dict[str, Any]) -> str:
         f"rows: {result['rows']}",
         f"rows_train: {result['rows_train']}",
         f"rows_valid: {result['rows_valid']}",
+        f"train_window: {result['train_start_date']} to {result['train_end_date']}",
+        f"eval_window: {result['eval_start_date']} to {result['eval_end_date']}",
         f"replay_rows: {result['replay_rows']}",
         f"valid_replay_rows: {result['valid_replay_rows']}",
         f"champion_model: {result['champion_model']}",
@@ -530,7 +536,24 @@ def app() -> None:
         return
 
     if args.command == "historical-backtest-kalshi":
-        print(_format_historical_backtest_output(run_historical_kalshi_backtest(args.start_date, args.end_date)))
+        eval_start_date = args.eval_start_date or args.start_date
+        eval_end_date = args.eval_end_date or args.end_date
+        if not eval_start_date or not eval_end_date:
+            raise SystemExit("historical-backtest-kalshi requires either --eval-start-date/--eval-end-date or --start-date/--end-date.")
+        train_start_date = args.train_start_date or settings().model_train_start_date
+        train_end_date = args.train_end_date
+        if train_end_date is None:
+            train_end_date = (date.fromisoformat(eval_start_date) - timedelta(days=1)).isoformat()
+        print(
+            _format_historical_backtest_output(
+                run_historical_kalshi_backtest(
+                    train_start_date=train_start_date,
+                    train_end_date=train_end_date,
+                    eval_start_date=eval_start_date,
+                    eval_end_date=eval_end_date,
+                )
+            )
+        )
         return
 
     if args.command == "backtest":
