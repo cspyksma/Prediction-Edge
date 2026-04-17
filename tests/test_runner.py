@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import date
 from pathlib import Path
 import uuid
@@ -108,3 +109,33 @@ def test_run_service_records_successful_run(monkeypatch) -> None:
         "discrepancies": 1,
         "game_results_synced": 4,
     }
+
+
+def test_run_service_logs_completion(monkeypatch, caplog) -> None:
+    db_path = _workspace_db_path("service-logging")
+    monkeypatch.setenv("DUCKDB_PATH", str(db_path))
+    monkeypatch.setenv("SNAPSHOT_INTERVAL_SECONDS", "0")
+    settings.cache_clear()
+
+    monkeypatch.setattr(
+        "mlpm.pipeline.runner.collect_snapshot",
+        lambda: {
+            "games": 5,
+            "kalshi_quotes": 10,
+            "polymarket_quotes": 8,
+            "model_predictions": 2,
+            "normalized_quotes": 18,
+            "discrepancies": 1,
+        },
+    )
+    monkeypatch.setattr(
+        "mlpm.pipeline.runner.sync_recent_game_results",
+        lambda lookback_days=None, reference_date=None: {"game_results_synced": 4},
+    )
+    monkeypatch.setattr("mlpm.pipeline.runner.time.sleep", lambda seconds: None)
+
+    with caplog.at_level(logging.INFO):
+        run_service(iterations=1)
+
+    assert "Collector run completed run_id=" in caplog.text
+    assert "game_results_synced" in caplog.text

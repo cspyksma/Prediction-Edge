@@ -191,10 +191,11 @@ def build_bet_opportunities(
 
 
 def run_bet_opportunity_report(start_date: str, end_date: str, model_name: str | None = None) -> dict[str, Any]:
-    filters = [f"game_date BETWEEN DATE '{start_date}' AND DATE '{end_date}'"]
+    filters = ["game_date BETWEEN ? AND ?"]
+    params: list[object] = [start_date, end_date]
     if model_name:
-        escaped = model_name.replace("'", "''")
-        filters.append(f"model_name = '{escaped}'")
+        filters.append("model_name = ?")
+        params.append(model_name)
     conn = connect_read_only(settings().duckdb_path)
     try:
         frame = query_dataframe(
@@ -204,7 +205,8 @@ def run_bet_opportunity_report(start_date: str, end_date: str, model_name: str |
             FROM bet_opportunities_deduped
             WHERE {' AND '.join(filters)}
             ORDER BY game_date DESC, event_start_time DESC, model_name
-            """
+            """,
+            params=params,
         )
     finally:
         conn.close()
@@ -226,10 +228,11 @@ def run_bet_opportunity_report(start_date: str, end_date: str, model_name: str |
 
 
 def run_strategy_performance_report(start_date: str, end_date: str, model_name: str | None = None) -> dict[str, Any]:
-    filters = [f"game_date BETWEEN DATE '{start_date}' AND DATE '{end_date}'"]
+    filters = ["game_date BETWEEN ? AND ?"]
+    params: list[object] = [start_date, end_date]
     if model_name:
-        escaped = model_name.replace("'", "''")
-        filters.append(f"model_name = '{escaped}'")
+        filters.append("model_name = ?")
+        params.append(model_name)
     conn = connect_read_only(settings().duckdb_path)
     try:
         frame = query_dataframe(
@@ -239,7 +242,8 @@ def run_strategy_performance_report(start_date: str, end_date: str, model_name: 
             FROM settled_bet_opportunities_deduped
             WHERE {' AND '.join(filters)}
             ORDER BY game_date, event_start_time, snapshot_ts
-            """
+            """,
+            params=params,
         )
         daily = query_dataframe(
             conn,
@@ -248,7 +252,8 @@ def run_strategy_performance_report(start_date: str, end_date: str, model_name: 
             FROM strategy_performance_daily
             WHERE {' AND '.join(filters)}
             ORDER BY game_date DESC, model_name, source
-            """
+            """,
+            params=params,
         )
     finally:
         conn.close()

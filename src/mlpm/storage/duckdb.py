@@ -651,5 +651,11 @@ def replace_dataframe(
     conn.unregister("frame_view")
 
 
-def query_dataframe(conn: duckdb.DuckDBPyConnection, sql: str) -> pd.DataFrame:
-    return conn.execute(sql).fetchdf()
+def query_dataframe(
+    conn: duckdb.DuckDBPyConnection,
+    sql: str,
+    params: list[object] | tuple[object, ...] | None = None,
+) -> pd.DataFrame:
+    if params is None:
+        return conn.execute(sql).fetchdf()
+    return conn.execute(sql, params).fetchdf()

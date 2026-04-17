@@ -139,3 +139,54 @@ def test_strategy_reports_compute_roi_and_champion(monkeypatch) -> None:
     assert strategy["windows"]["model_a"]["all"]["bets"] == 1
     assert strategy["windows"]["model_a"]["all"]["units_won"] > 0
     assert strategy["champion_model"] in {"model_a", "model_b"}
+
+
+def test_run_strategy_performance_report_parameterizes_model_name(monkeypatch) -> None:
+    db_path = _workspace_db_path("strategy-params")
+    monkeypatch.setenv("DUCKDB_PATH", str(db_path))
+    monkeypatch.setenv("STRATEGY_CHAMPION_MIN_BETS", "1")
+    settings.cache_clear()
+    conn = connect(settings().duckdb_path)
+    append_dataframe(
+        conn,
+        "bet_opportunities",
+        pd.DataFrame(
+            [
+                {
+                    "game_id": "g1",
+                    "game_date": "2026-04-14",
+                    "event_start_time": "2026-04-14T18:00:00",
+                    "snapshot_ts": "2026-04-14T17:00:00",
+                    "collection_run_ts": "2026-04-14T17:00:00",
+                    "model_name": "safe_model",
+                    "source": "kalshi",
+                    "market_id": "m1",
+                    "team": "Home",
+                    "opponent_team": "Away",
+                    "is_home_team": True,
+                    "model_prob": 0.7,
+                    "market_prob": 0.6,
+                    "edge_bps": 1000,
+                    "expected_value": 0.1,
+                    "implied_decimal_odds": 1.6,
+                    "stake_units": 1.0,
+                    "is_actionable": True,
+                    "is_champion": False,
+                }
+            ]
+        ),
+    )
+    append_dataframe(
+        conn,
+        "game_results",
+        pd.DataFrame(
+            [
+                {"game_id": "g1", "game_date": "2026-04-14", "away_team": "Away", "home_team": "Home", "winner_team": "Home", "away_score": 2, "home_score": 4}
+            ]
+        ),
+    )
+    conn.close()
+
+    result = run_strategy_performance_report("2026-04-14", "2026-04-14", model_name="safe_model' OR 1=1 --")
+
+    assert result == {"status": "insufficient_data", "rows": 0}

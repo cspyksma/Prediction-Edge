@@ -5,14 +5,14 @@ from typing import Any
 import httpx
 import pandas as pd
 
+from mlpm.ingest.http import get_json_with_retries
+
 POLYMARKET_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 POLYMARKET_SPORTS_URL = "https://gamma-api.polymarket.com/sports"
 MLB_SPORT = "mlb"
 
 def _fetch_mlb_tag_id(client: httpx.Client) -> int:
-    response = client.get(POLYMARKET_SPORTS_URL)
-    response.raise_for_status()
-    sports = response.json()
+    sports = get_json_with_retries(client, POLYMARKET_SPORTS_URL)
     for sport in sports:
         if str(sport.get("sport", "")).lower() == MLB_SPORT:
             tags = [tag.strip() for tag in str(sport.get("tags", "")).split(",") if tag.strip()]
@@ -26,9 +26,7 @@ def fetch_mlb_markets(limit: int = 500) -> tuple[pd.DataFrame, Any]:
     with httpx.Client(timeout=20.0) as client:
         tag_id = _fetch_mlb_tag_id(client)
         params = {"tag_id": tag_id, "limit": limit, "closed": "false", "active": "true"}
-        response = client.get(POLYMARKET_MARKETS_URL, params=params)
-        response.raise_for_status()
-        payload = response.json()
+        payload = get_json_with_retries(client, POLYMARKET_MARKETS_URL, params=params)
 
     rows: list[dict[str, object]] = []
     for market in payload:

@@ -14,10 +14,11 @@ def run_settled_prediction_report(
     end_date: str,
     model_name: str | None = None,
 ) -> dict[str, Any]:
-    filters = [f"game_date BETWEEN DATE '{start_date}' AND DATE '{end_date}'"]
+    filters = ["game_date BETWEEN ? AND ?"]
+    params: list[object] = [start_date, end_date]
     if model_name:
-        escaped_model_name = model_name.replace("'", "''")
-        filters.append(f"model_name = '{escaped_model_name}'")
+        filters.append("model_name = ?")
+        params.append(model_name)
 
     conn = connect_read_only(settings().duckdb_path)
     try:
@@ -29,6 +30,7 @@ def run_settled_prediction_report(
             WHERE {' AND '.join(filters)}
             ORDER BY game_date, event_start_time, snapshot_ts
             """,
+            params=params,
         )
     finally:
         conn.close()
@@ -72,10 +74,11 @@ def run_settled_window_report(
     if base.get("status") != "ok":
         return base
 
-    filters = [f"game_date BETWEEN DATE '{start_date}' AND DATE '{end_date}'"]
+    filters = ["game_date BETWEEN ? AND ?"]
+    params: list[object] = [start_date, end_date]
     if model_name:
-        escaped_model_name = model_name.replace("'", "''")
-        filters.append(f"model_name = '{escaped_model_name}'")
+        filters.append("model_name = ?")
+        params.append(model_name)
 
     conn = connect_read_only(settings().duckdb_path)
     try:
@@ -87,6 +90,7 @@ def run_settled_window_report(
             WHERE {' AND '.join(filters)}
             ORDER BY game_date, event_start_time, snapshot_ts
             """,
+            params=params,
         )
         daily = query_dataframe(
             conn,
@@ -95,7 +99,8 @@ def run_settled_window_report(
             FROM settled_prediction_daily
             WHERE {' AND '.join(filters)}
             ORDER BY game_date DESC, model_name
-            """
+            """,
+            params=params,
         )
     finally:
         conn.close()

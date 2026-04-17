@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 from datetime import date, timedelta
 from typing import Any
 
@@ -21,6 +22,20 @@ from mlpm.models.game_outcome import (
 )
 
 
+def _iso_date_arg(value: str) -> str:
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Invalid ISO date: {value}") from exc
+
+
+def _configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mlpm")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -37,70 +52,70 @@ def _build_parser() -> argparse.ArgumentParser:
     sync_results.add_argument("--lookback-days", type=int, default=settings().results_sync_lookback_days)
 
     settled = subparsers.add_parser("report-settled-predictions", help="Grade stored pregame predictions against final results.")
-    settled.add_argument("--start-date", required=True)
-    settled.add_argument("--end-date", required=True)
+    settled.add_argument("--start-date", required=True, type=_iso_date_arg)
+    settled.add_argument("--end-date", required=True, type=_iso_date_arg)
     settled.add_argument("--model-name")
 
     settled_windows = subparsers.add_parser("report-settled-windows", help="Summarize rolling settled prediction performance.")
-    settled_windows.add_argument("--start-date", required=True)
-    settled_windows.add_argument("--end-date", required=True)
+    settled_windows.add_argument("--start-date", required=True, type=_iso_date_arg)
+    settled_windows.add_argument("--end-date", required=True, type=_iso_date_arg)
     settled_windows.add_argument("--model-name")
 
     opportunities = subparsers.add_parser("report-bet-opportunities", help="Summarize live edge opportunities by model.")
-    opportunities.add_argument("--start-date", required=True)
-    opportunities.add_argument("--end-date", required=True)
+    opportunities.add_argument("--start-date", required=True, type=_iso_date_arg)
+    opportunities.add_argument("--end-date", required=True, type=_iso_date_arg)
     opportunities.add_argument("--model-name")
 
     strategy = subparsers.add_parser("report-strategy-performance", help="Summarize settled flat-stake betting performance.")
-    strategy.add_argument("--start-date", required=True)
-    strategy.add_argument("--end-date", required=True)
+    strategy.add_argument("--start-date", required=True, type=_iso_date_arg)
+    strategy.add_argument("--end-date", required=True, type=_iso_date_arg)
     strategy.add_argument("--model-name")
 
     historical_poly = subparsers.add_parser("historical-backfill-polymarket", help="Backfill historical Polymarket market prices.")
-    historical_poly.add_argument("--start-date", required=True)
-    historical_poly.add_argument("--end-date", required=True)
+    historical_poly.add_argument("--start-date", required=True, type=_iso_date_arg)
+    historical_poly.add_argument("--end-date", required=True, type=_iso_date_arg)
     historical_poly.add_argument("--interval", default="1m")
     historical_poly.add_argument("--chunk-days", type=int, default=7)
     historical_poly.add_argument("--no-resume", action="store_true")
 
     historical_kalshi = subparsers.add_parser("historical-backfill-kalshi", help="Backfill historical Kalshi market prices.")
-    historical_kalshi.add_argument("--start-date", required=True)
-    historical_kalshi.add_argument("--end-date", required=True)
+    historical_kalshi.add_argument("--start-date", required=True, type=_iso_date_arg)
+    historical_kalshi.add_argument("--end-date", required=True, type=_iso_date_arg)
     historical_kalshi.add_argument("--period-interval", type=int, default=1)
     historical_kalshi.add_argument("--include-trades", action="store_true")
     historical_kalshi.add_argument("--chunk-days", type=int, default=7)
     historical_kalshi.add_argument("--no-resume", action="store_true")
 
     historical_status = subparsers.add_parser("historical-import-status", help="Show historical import status by source.")
-    historical_status.add_argument("--start-date", required=True)
-    historical_status.add_argument("--end-date", required=True)
+    historical_status.add_argument("--start-date", required=True, type=_iso_date_arg)
+    historical_status.add_argument("--end-date", required=True, type=_iso_date_arg)
 
     historical_backtest = subparsers.add_parser("historical-backtest-kalshi", help="Backtest tabular models against replay-selected Kalshi pregame quotes.")
-    historical_backtest.add_argument("--start-date")
-    historical_backtest.add_argument("--end-date")
-    historical_backtest.add_argument("--train-start-date")
-    historical_backtest.add_argument("--train-end-date")
-    historical_backtest.add_argument("--eval-start-date")
-    historical_backtest.add_argument("--eval-end-date")
+    historical_backtest.add_argument("--start-date", type=_iso_date_arg)
+    historical_backtest.add_argument("--end-date", type=_iso_date_arg)
+    historical_backtest.add_argument("--train-start-date", type=_iso_date_arg)
+    historical_backtest.add_argument("--train-end-date", type=_iso_date_arg)
+    historical_backtest.add_argument("--eval-start-date", type=_iso_date_arg)
+    historical_backtest.add_argument("--eval-end-date", type=_iso_date_arg)
 
     backtest = subparsers.add_parser("backtest", help="Run a simple backtest over stored data.")
-    backtest.add_argument("--start-date", required=True)
-    backtest.add_argument("--end-date", required=True)
+    backtest.add_argument("--start-date", required=True, type=_iso_date_arg)
+    backtest.add_argument("--end-date", required=True, type=_iso_date_arg)
 
     train_model = subparsers.add_parser("train-game-model", help="Train and persist the MLB game-outcome model.")
-    train_model.add_argument("--start-date", default=settings().model_train_start_date)
-    train_model.add_argument("--end-date", default=date.today().isoformat())
+    train_model.add_argument("--start-date", default=settings().model_train_start_date, type=_iso_date_arg)
+    train_model.add_argument("--end-date", default=date.today().isoformat(), type=_iso_date_arg)
 
     benchmark_model = subparsers.add_parser("benchmark-game-model", help="Benchmark the game-outcome model against simple baselines.")
-    benchmark_model.add_argument("--start-date", default=settings().model_train_start_date)
-    benchmark_model.add_argument("--end-date", default=date.today().isoformat())
+    benchmark_model.add_argument("--start-date", default=settings().model_train_start_date, type=_iso_date_arg)
+    benchmark_model.add_argument("--end-date", default=date.today().isoformat(), type=_iso_date_arg)
 
     select_features = subparsers.add_parser(
         "forward-select-game-features",
         help="Run forward logistic feature selection scored by AIC and BIC.",
     )
-    select_features.add_argument("--start-date", default=settings().model_train_start_date)
-    select_features.add_argument("--end-date", default=date.today().isoformat())
+    select_features.add_argument("--start-date", default=settings().model_train_start_date, type=_iso_date_arg)
+    select_features.add_argument("--end-date", default=date.today().isoformat(), type=_iso_date_arg)
 
     return parser
 
@@ -455,6 +470,7 @@ def _format_historical_backtest_output(result: dict[str, Any]) -> str:
 
 
 def app() -> None:
+    _configure_logging()
     parser = _build_parser()
     args = parser.parse_args()
 

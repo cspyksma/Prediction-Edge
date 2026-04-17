@@ -1,6 +1,9 @@
 from pathlib import Path
 
+import pytest
+
 from mlpm.cli import (
+    _build_parser,
     _format_bet_opportunity_output,
     _format_benchmark_game_model_output,
     _format_historical_import_output,
@@ -229,3 +232,35 @@ def test_format_historical_backtest_output_includes_roi_metrics() -> None:
     assert "eval_window: 2026-04-01 to 2026-04-02" in output
     assert "champion_model: mlb_win_bayes_v1" in output
     assert "calibration_rows: 1" in output
+
+
+def test_cli_parser_validates_iso_date_arguments() -> None:
+    parser = _build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "backtest",
+                "--start-date",
+                "2026-99-99",
+                "--end-date",
+                "2026-04-07",
+            ]
+        )
+
+
+def test_cli_parser_normalizes_valid_iso_dates() -> None:
+    parser = _build_parser()
+
+    args = parser.parse_args(
+        [
+            "backtest",
+            "--start-date",
+            "2026-04-01",
+            "--end-date",
+            "2026-04-07",
+        ]
+    )
+
+    assert args.start_date == "2026-04-01"
+    assert args.end_date == "2026-04-07"

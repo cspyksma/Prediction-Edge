@@ -5,18 +5,19 @@ from typing import Any
 import httpx
 import pandas as pd
 
+from mlpm.ingest.http import get_json_with_retries
+
 KALSHI_MARKETS_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
 KALSHI_MLB_GAME_SERIES = "KXMLBGAME"
 
 
 def fetch_mlb_markets() -> tuple[pd.DataFrame, Any]:
     with httpx.Client(timeout=20.0) as client:
-        markets_response = client.get(
+        markets_payload = get_json_with_retries(
+            client,
             KALSHI_MARKETS_URL,
             params={"limit": 1000, "status": "open", "series_ticker": KALSHI_MLB_GAME_SERIES},
         )
-        markets_response.raise_for_status()
-        markets_payload = markets_response.json()
 
     rows: list[dict[str, object]] = []
     for market in markets_payload.get("markets", []):

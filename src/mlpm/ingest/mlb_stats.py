@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 
 import httpx
 import pandas as pd
 
 from mlpm.ingest.base import utcnow
+from mlpm.ingest.http import get_json_with_retries
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
 MLB_BOXSCORE_URL = "https://statsapi.mlb.com/api/v1/game/{game_id}/boxscore"
 MLB_PEOPLE_URL = "https://statsapi.mlb.com/api/v1/people/{player_id}"
+BOXSCORE_FETCH_BATCH_SIZE = 25
+BOX_SCORE_MAX_WORKERS = 8
 
 
 def _scheduled_first_pitch_utc(game: dict[str, object]) -> str | None:
@@ -36,9 +40,7 @@ def fetch_upcoming_games(lookahead_days: int = 3) -> pd.DataFrame:
     }
 
     with httpx.Client(timeout=20.0) as client:
-        response = client.get(MLB_SCHEDULE_URL, params=params)
-        response.raise_for_status()
-        payload = response.json()
+        payload = get_json_with_retries(client, MLB_SCHEDULE_URL, params=params)
 
     rows: list[dict[str, object]] = []
     for schedule_date in payload.get("dates", []):
@@ -93,9 +95,7 @@ def fetch_upcoming_games(lookahead_days: int = 3) -> pd.DataFrame:
 def fetch_final_results(start_date: str, end_date: str) -> pd.DataFrame:
     params = {"sportId": 1, "startDate": start_date, "endDate": end_date}
     with httpx.Client(timeout=20.0) as client:
-        response = client.get(MLB_SCHEDULE_URL, params=params)
-        response.raise_for_status()
-        payload = response.json()
+        payload = get_json_with_retries(client, MLB_SCHEDULE_URL, params=params)
 
     rows: list[dict[str, object]] = []
     for schedule_date in payload.get("dates", []):
@@ -130,77 +130,75 @@ def fetch_game_pitching_logs(start_date: str, end_date: str) -> pd.DataFrame:
     if results.empty:
         return pd.DataFrame()
 
+    boxscores = _fetch_boxscore_payloads(results["game_id"].astype(str).tolist())
     rows: list[dict[str, object]] = []
-    with httpx.Client(timeout=20.0) as client:
-        for game in results.to_dict(orient="records"):
-            response = client.get(MLB_BOXSCORE_URL.format(game_id=game["game_id"]))
-            response.raise_for_status()
-            payload = response.json()
-            for side in ("away", "home"):
-                team_box = payload.get("teams", {}).get(side, {})
-                team_name = team_box.get("team", {}).get("name")
-                players = team_box.get("players", {}) or {}
-                pitchers = team_box.get("pitchers", []) or []
+    for game in results.to_dict(orient="records"):
+        payload = boxscores[game["game_id"]]
+        for side in ("away", "home"):
+            team_box = payload.get("teams", {}).get(side, {})
+            team_name = team_box.get("team", {}).get("name")
+            players = team_box.get("players", {}) or {}
+            pitchers = team_box.get("pitchers", []) or []
 
-                starter_id: int | None = None
-                starter_name: str | None = None
-                starter_innings = 0.0
-                starter_earned_runs = 0
-                starter_hits = 0
-                starter_walks = 0
-                starter_strikeouts = 0
+            starter_id: int | None = None
+            starter_name: str | None = None
+            starter_innings = 0.0
+            starter_earned_runs = 0
+            starter_hits = 0
+            starter_walks = 0
+            starter_strikeouts = 0
 
-                bullpen_innings = 0.0
-                bullpen_pitches = 0
-                relievers_used = 0
+            bullpen_innings = 0.0
+            bullpen_pitches = 0
+            relievers_used = 0
 
-                for pitcher_id in pitchers:
-                    player = players.get(f"ID{pitcher_id}", {})
-                    pitching = player.get("stats", {}).get("pitching", {})
-                    if not pitching:
-                        continue
+            for pitcher_id in pitchers:
+                player = players.get(f"ID{pitcher_id}", {})
+                pitching = player.get("stats", {}).get("pitching", {})
+                if not pitching:
+                    continue
 
-                    games_started = int(pitching.get("gamesStarted", 0) or 0)
-                    innings_pitched = _innings_to_float(pitching.get("inningsPitched"))
-                    earned_runs = _to_int(pitching.get("earnedRuns"))
-                    hits = _to_int(pitching.get("hits"))
-                    walks = _to_int(pitching.get("baseOnBalls"))
-                    strikeouts = _to_int(pitching.get("strikeOuts"))
-                    pitches_thrown = _to_int(pitching.get("pitchesThrown") or pitching.get("numberOfPitches"))
+                games_started = int(pitching.get("gamesStarted", 0) or 0)
+                innings_pitched = _innings_to_float(pitching.get("inningsPitched"))
+                earned_runs = _to_int(pitching.get("earnedRuns"))
+                hits = _to_int(pitching.get("hits"))
+                walks = _to_int(pitching.get("baseOnBalls"))
+                strikeouts = _to_int(pitching.get("strikeOuts"))
+                pitches_thrown = _to_int(pitching.get("pitchesThrown") or pitching.get("numberOfPitches"))
 
-                    if games_started > 0 and starter_id is None:
-                        starter_id = pitcher_id
-                        starter_name = player.get("person", {}).get("fullName")
-                        starter_innings = innings_pitched
-                        starter_earned_runs = earned_runs
-                        starter_hits = hits
-                        starter_walks = walks
-                        starter_strikeouts = strikeouts
-                        continue
+                if games_started > 0 and starter_id is None:
+                    starter_id = pitcher_id
+                    starter_name = player.get("person", {}).get("fullName")
+                    starter_innings = innings_pitched
+                    starter_earned_runs = earned_runs
+                    starter_hits = hits
+                    starter_walks = walks
+                    starter_strikeouts = strikeouts
+                    continue
 
-                    relievers_used += 1
-                    bullpen_innings += innings_pitched
-                    bullpen_pitches += pitches_thrown
+                relievers_used += 1
+                bullpen_innings += innings_pitched
+                bullpen_pitches += pitches_thrown
 
-                rows.append(
-                    {
-                        "game_id": game["game_id"],
-                        "game_date": game["game_date"],
-                        "team": team_name,
-                        "side": side,
-                        "starting_pitcher_id": starter_id,
-                        "starting_pitcher_name": starter_name,
-                        "starting_pitcher_hand": None,
-                        "starter_innings_pitched": starter_innings,
-                        "starter_earned_runs": starter_earned_runs,
-                        "starter_hits": starter_hits,
-                        "starter_walks": starter_walks,
-                        "starter_strikeouts": starter_strikeouts,
-                        "bullpen_innings": bullpen_innings,
-                        "bullpen_pitches": bullpen_pitches,
-                        "relievers_used": relievers_used,
-                    }
-                )
+            rows.append(
+                {
+                    "game_id": game["game_id"],
+                    "game_date": game["game_date"],
+                    "team": team_name,
+                    "side": side,
+                    "starting_pitcher_id": starter_id,
+                    "starting_pitcher_name": starter_name,
+                    "starting_pitcher_hand": None,
+                    "starter_innings_pitched": starter_innings,
+                    "starter_earned_runs": starter_earned_runs,
+                    "starter_hits": starter_hits,
+                    "starter_walks": starter_walks,
+                    "starter_strikeouts": starter_strikeouts,
+                    "bullpen_innings": bullpen_innings,
+                    "bullpen_pitches": bullpen_pitches,
+                    "relievers_used": relievers_used,
+                }
+            )
     pitching_logs = pd.DataFrame(rows)
     if pitching_logs.empty:
         return pitching_logs
@@ -222,35 +220,33 @@ def fetch_game_batting_logs(start_date: str, end_date: str) -> pd.DataFrame:
     if results.empty:
         return pd.DataFrame()
 
+    boxscores = _fetch_boxscore_payloads(results["game_id"].astype(str).tolist())
     rows: list[dict[str, object]] = []
-    with httpx.Client(timeout=20.0) as client:
-        for game in results.to_dict(orient="records"):
-            response = client.get(MLB_BOXSCORE_URL.format(game_id=game["game_id"]))
-            response.raise_for_status()
-            payload = response.json()
-            for side in ("away", "home"):
-                team_box = payload.get("teams", {}).get(side, {})
-                team_name = team_box.get("team", {}).get("name")
-                batting = team_box.get("teamStats", {}).get("batting", {}) or {}
-                if not team_name or not batting:
-                    continue
-                is_home = side == "home"
-                rows.append(
-                    {
-                        "game_id": game["game_id"],
-                        "game_date": game["game_date"],
-                        "team": team_name,
-                        "opponent_team": game["away_team"] if is_home else game["home_team"],
-                        "at_bats": _to_int(batting.get("atBats")),
-                        "hits": _to_int(batting.get("hits")),
-                        "walks": _to_int(batting.get("baseOnBalls")),
-                        "strikeouts": _to_int(batting.get("strikeOuts")),
-                        "doubles": _to_int(batting.get("doubles")),
-                        "triples": _to_int(batting.get("triples")),
-                        "home_runs": _to_int(batting.get("homeRuns")),
-                        "runs_scored": int(game["home_score"] if is_home else game["away_score"]),
-                    }
-                )
+    for game in results.to_dict(orient="records"):
+        payload = boxscores[game["game_id"]]
+        for side in ("away", "home"):
+            team_box = payload.get("teams", {}).get(side, {})
+            team_name = team_box.get("team", {}).get("name")
+            batting = team_box.get("teamStats", {}).get("batting", {}) or {}
+            if not team_name or not batting:
+                continue
+            is_home = side == "home"
+            rows.append(
+                {
+                    "game_id": game["game_id"],
+                    "game_date": game["game_date"],
+                    "team": team_name,
+                    "opponent_team": game["away_team"] if is_home else game["home_team"],
+                    "at_bats": _to_int(batting.get("atBats")),
+                    "hits": _to_int(batting.get("hits")),
+                    "walks": _to_int(batting.get("baseOnBalls")),
+                    "strikeouts": _to_int(batting.get("strikeOuts")),
+                    "doubles": _to_int(batting.get("doubles")),
+                    "triples": _to_int(batting.get("triples")),
+                    "home_runs": _to_int(batting.get("homeRuns")),
+                    "runs_scored": int(game["home_score"] if is_home else game["away_score"]),
+                }
+            )
     return pd.DataFrame(rows)
 
 
@@ -262,9 +258,7 @@ def fetch_pitcher_handedness(player_ids: list[int | str]) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     with httpx.Client(timeout=20.0) as client:
         for pitcher_id in unique_ids:
-            response = client.get(MLB_PEOPLE_URL.format(player_id=pitcher_id))
-            response.raise_for_status()
-            payload = response.json()
+            payload = get_json_with_retries(client, MLB_PEOPLE_URL.format(player_id=pitcher_id))
             people = payload.get("people", [])
             if not people:
                 continue
@@ -286,35 +280,33 @@ def fetch_recent_pitcher_form(player_ids: list[int | str], end_date: str, lookba
         return pd.DataFrame()
 
     appearance_rows: list[dict[str, object]] = []
-    with httpx.Client(timeout=20.0) as client:
-        for game in results.to_dict(orient="records"):
-            response = client.get(MLB_BOXSCORE_URL.format(game_id=game["game_id"]))
-            response.raise_for_status()
-            payload = response.json()
-            for side in ("away", "home"):
-                team_box = payload.get("teams", {}).get(side, {})
-                players = team_box.get("players", {}) or {}
-                for pitcher_id in team_box.get("pitchers", []) or []:
-                    if pitcher_id not in unique_ids:
-                        continue
-                    player = players.get(f"ID{pitcher_id}", {})
-                    pitching = player.get("stats", {}).get("pitching", {})
-                    if not pitching:
-                        continue
-                    appearance_rows.append(
-                        {
-                            "pitcher_id": pitcher_id,
-                            "pitcher_name": player.get("person", {}).get("fullName"),
-                            "game_id": game["game_id"],
-                            "game_date": game["game_date"],
-                            "games_started": _to_int(pitching.get("gamesStarted")),
-                            "innings_pitched": _innings_to_float(pitching.get("inningsPitched")),
-                            "earned_runs": _to_int(pitching.get("earnedRuns")),
-                            "hits": _to_int(pitching.get("hits")),
-                            "walks": _to_int(pitching.get("baseOnBalls")),
-                            "strikeouts": _to_int(pitching.get("strikeOuts")),
-                        }
-                    )
+    boxscores = _fetch_boxscore_payloads(results["game_id"].astype(str).tolist())
+    for game in results.to_dict(orient="records"):
+        payload = boxscores[game["game_id"]]
+        for side in ("away", "home"):
+            team_box = payload.get("teams", {}).get(side, {})
+            players = team_box.get("players", {}) or {}
+            for pitcher_id in team_box.get("pitchers", []) or []:
+                if pitcher_id not in unique_ids:
+                    continue
+                player = players.get(f"ID{pitcher_id}", {})
+                pitching = player.get("stats", {}).get("pitching", {})
+                if not pitching:
+                    continue
+                appearance_rows.append(
+                    {
+                        "pitcher_id": pitcher_id,
+                        "pitcher_name": player.get("person", {}).get("fullName"),
+                        "game_id": game["game_id"],
+                        "game_date": game["game_date"],
+                        "games_started": _to_int(pitching.get("gamesStarted")),
+                        "innings_pitched": _innings_to_float(pitching.get("inningsPitched")),
+                        "earned_runs": _to_int(pitching.get("earnedRuns")),
+                        "hits": _to_int(pitching.get("hits")),
+                        "walks": _to_int(pitching.get("baseOnBalls")),
+                        "strikeouts": _to_int(pitching.get("strikeOuts")),
+                    }
+                )
 
     appearances = pd.DataFrame(appearance_rows)
     if appearances.empty:
@@ -367,39 +359,37 @@ def fetch_recent_bullpen_usage(end_date: str, lookback_days: int = 3) -> pd.Data
         return pd.DataFrame()
 
     rows: list[dict[str, object]] = []
-    with httpx.Client(timeout=20.0) as client:
-        for game in results.to_dict(orient="records"):
-            response = client.get(MLB_BOXSCORE_URL.format(game_id=game["game_id"]))
-            response.raise_for_status()
-            payload = response.json()
-            for side in ("away", "home"):
-                team_box = payload.get("teams", {}).get(side, {})
-                team_name = team_box.get("team", {}).get("name")
-                pitchers = team_box.get("pitchers", []) or []
-                players = team_box.get("players", {}) or {}
-                bullpen_innings = 0.0
-                bullpen_pitches = 0
-                relievers_used = 0
-                for pitcher_id in pitchers:
-                    player = players.get(f"ID{pitcher_id}", {})
-                    pitching = player.get("stats", {}).get("pitching", {})
-                    if not pitching:
-                        continue
-                    if int(pitching.get("gamesStarted", 0) or 0) > 0:
-                        continue
-                    relievers_used += 1
-                    bullpen_innings += _innings_to_float(pitching.get("inningsPitched"))
-                    bullpen_pitches += _to_int(pitching.get("pitchesThrown") or pitching.get("numberOfPitches"))
-                rows.append(
-                    {
-                        "game_id": game["game_id"],
-                        "game_date": game["game_date"],
-                        "team": team_name,
-                        "bullpen_innings": bullpen_innings,
-                        "bullpen_pitches": bullpen_pitches,
-                        "relievers_used": relievers_used,
-                    }
-                )
+    boxscores = _fetch_boxscore_payloads(results["game_id"].astype(str).tolist())
+    for game in results.to_dict(orient="records"):
+        payload = boxscores[game["game_id"]]
+        for side in ("away", "home"):
+            team_box = payload.get("teams", {}).get(side, {})
+            team_name = team_box.get("team", {}).get("name")
+            pitchers = team_box.get("pitchers", []) or []
+            players = team_box.get("players", {}) or {}
+            bullpen_innings = 0.0
+            bullpen_pitches = 0
+            relievers_used = 0
+            for pitcher_id in pitchers:
+                player = players.get(f"ID{pitcher_id}", {})
+                pitching = player.get("stats", {}).get("pitching", {})
+                if not pitching:
+                    continue
+                if int(pitching.get("gamesStarted", 0) or 0) > 0:
+                    continue
+                relievers_used += 1
+                bullpen_innings += _innings_to_float(pitching.get("inningsPitched"))
+                bullpen_pitches += _to_int(pitching.get("pitchesThrown") or pitching.get("numberOfPitches"))
+            rows.append(
+                {
+                    "game_id": game["game_id"],
+                    "game_date": game["game_date"],
+                    "team": team_name,
+                    "bullpen_innings": bullpen_innings,
+                    "bullpen_pitches": bullpen_pitches,
+                    "relievers_used": relievers_used,
+                }
+            )
     usage = pd.DataFrame(rows)
     if usage.empty:
         return usage
@@ -446,3 +436,21 @@ def _innings_to_float(value: object) -> float:
         return float(text)
     whole, outs = text.split(".", maxsplit=1)
     return int(whole) + (int(outs) / 3.0)
+
+
+def _fetch_boxscore_payloads(game_ids: list[str]) -> dict[str, dict]:
+    unique_game_ids = [str(game_id) for game_id in dict.fromkeys(game_ids)]
+    payloads: dict[str, dict] = {}
+    for start in range(0, len(unique_game_ids), BOXSCORE_FETCH_BATCH_SIZE):
+        batch = unique_game_ids[start : start + BOXSCORE_FETCH_BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=min(BOX_SCORE_MAX_WORKERS, len(batch) or 1)) as executor:
+            future_to_game_id = {executor.submit(_fetch_boxscore_payload, game_id): game_id for game_id in batch}
+            for future in as_completed(future_to_game_id):
+                game_id = future_to_game_id[future]
+                payloads[game_id] = future.result()
+    return payloads
+
+
+def _fetch_boxscore_payload(game_id: str) -> dict:
+    with httpx.Client(timeout=20.0) as client:
+        return get_json_with_retries(client, MLB_BOXSCORE_URL.format(game_id=game_id))

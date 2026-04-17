@@ -1,6 +1,9 @@
+import logging
+import pickle
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from mlpm.models.game_outcome import (
     BAYES_MODEL_NAME,
@@ -119,6 +122,54 @@ def test_train_game_outcome_model_and_reload() -> None:
         assert "log_loss" in bundle["candidate_metrics"][SVM_MODEL_NAME]
     finally:
         saved_path.unlink(missing_ok=True)
+
+
+def test_load_trained_model_supports_legacy_pickle_artifact() -> None:
+    artifact_dir = Path("data/processed/test_artifacts")
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    saved_path = artifact_dir / "legacy_game_outcome_model.pkl"
+    payload = {"model_name": "legacy"}
+    try:
+        saved_path.unlink(missing_ok=True)
+        with saved_path.open("wb") as handle:
+            pickle.dump(payload, handle)
+        loaded = load_trained_model(saved_path)
+        assert loaded == payload
+    finally:
+        saved_path.unlink(missing_ok=True)
+
+
+def test_build_training_dataset_logs_skipped_min_games(caplog) -> None:
+    results = pd.DataFrame(
+        [
+            {"game_id": "1", "game_date": "2026-04-01", "away_team": "A", "home_team": "B", "winner_team": "A", "away_score": 5, "home_score": 3},
+            {"game_id": "2", "game_date": "2026-04-02", "away_team": "A", "home_team": "B", "winner_team": "B", "away_score": 2, "home_score": 4},
+        ]
+    )
+    pitching_logs = pd.DataFrame()
+
+    with caplog.at_level(logging.WARNING):
+        training = build_training_dataset(results, pitching_logs, min_games=5)
+
+    assert training.empty
+    assert "Training dataset dropped 2 games below MODEL_MIN_GAMES" in caplog.text
+
+
+def test_train_game_outcome_model_raises_on_missing_feature_columns() -> None:
+    rows = []
+    for index in range(12):
+        row = {
+            "game_id": str(index),
+            "game_date": pd.Timestamp("2026-04-01") + pd.Timedelta(days=index),
+            "target_home_win": index % 2,
+        }
+        for feature in FEATURE_COLUMNS:
+            row[feature] = 0.1 if index % 2 else -0.1
+        rows.append(row)
+    training_df = pd.DataFrame(rows).drop(columns=["elo_diff"])
+
+    with pytest.raises(ValueError, match="Missing required columns in feature frame: elo_diff"):
+        train_game_outcome_model(training_df)
 
 
 def test_benchmark_game_outcome_models_returns_baselines() -> None:

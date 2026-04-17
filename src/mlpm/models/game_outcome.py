@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import pickle
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,6 +8,8 @@ from pathlib import Path
 import mlflow
 import numpy as np
 import pandas as pd
+from joblib import dump as joblib_dump
+from joblib import load as joblib_load
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.impute import SimpleImputer
@@ -22,6 +25,8 @@ from mlpm.features.matchups import OFFENSE_SPLIT_PRIOR, offense_score_from_stats
 from mlpm.features.team_strength import ELO_BASELINE, ELO_K_FACTOR, RECENT_GAMES_WINDOW
 from mlpm.ingest.mlb_stats import fetch_final_results, fetch_game_batting_logs, fetch_game_pitching_logs
 from mlpm.storage.duckdb import connect, query_dataframe
+
+logger = logging.getLogger(__name__)
 
 LOGISTIC_MODEL_NAME = "mlb_win_logreg_v2"
 HISTGB_MODEL_NAME = "mlb_win_histgb_v1"
@@ -90,17 +95,20 @@ def artifact_path() -> Path:
 
 
 def load_trained_model(path: Path | None = None) -> dict[str, object] | None:
+    """Load trusted-local model artifacts only. Do not load untrusted files."""
     model_path = path or artifact_path()
     if not model_path.exists():
         return None
-    with model_path.open("rb") as handle:
-        return pickle.load(handle)
+    try:
+        return joblib_load(model_path)
+    except Exception:
+        with model_path.open("rb") as handle:
+            return pickle.load(handle)
 
 
 def save_trained_model(bundle: dict[str, object], path: Path | None = None) -> Path:
     model_path = path or artifact_path()
-    with model_path.open("wb") as handle:
-        pickle.dump(bundle, handle)
+    joblib_dump(bundle, model_path)
     return model_path
 
 
@@ -126,6 +134,7 @@ def build_training_dataset(
     minimum_games = settings().model_min_games if min_games is None else min_games
     results = results_df.copy()
     results["game_date"] = pd.to_datetime(results["game_date"])
+    skipped_min_games = 0
 
     pitching_logs = pitching_logs_df.copy()
     if not pitching_logs.empty:
@@ -187,6 +196,8 @@ def build_training_dataset(
                     ),
                 }
             )
+        else:
+            skipped_min_games += 1
 
         _update_histories(
             game,
@@ -199,7 +210,16 @@ def build_training_dataset(
         )
         _update_elo(game, elo_ratings)
 
-    return pd.DataFrame(rows)
+    training_df = pd.DataFrame(rows)
+    if skipped_min_games > 0:
+        logger.warning(
+            "Training dataset dropped %s games below MODEL_MIN_GAMES; source_games=%s produced_rows=%s min_games=%s",
+            skipped_min_games,
+            len(results),
+            len(training_df),
+            minimum_games,
+        )
+    return training_df
 
 
 def train_game_outcome_model(training_df: pd.DataFrame) -> dict[str, object]:
@@ -207,6 +227,7 @@ def train_game_outcome_model(training_df: pd.DataFrame) -> dict[str, object]:
         raise ValueError("Training dataset is empty.")
     if training_df["target_home_win"].nunique() < 2:
         raise ValueError("Training dataset must contain both classes.")
+    _require_feature_columns(training_df)
 
     train_df, valid_df = _split_training_data(training_df)
     candidate_models = _fit_candidate_models(train_df)
@@ -269,6 +290,7 @@ def run_model_benchmark(start_date: str, end_date: str) -> dict[str, object]:
     training_df = build_training_dataset(results_df, pitching_logs_df, batting_logs_df=batting_logs_df, market_priors_df=market_priors_df)
     if training_df.empty:
         return {"status": "insufficient_data", "rows": 0}
+    _require_feature_columns(training_df)
 
     train_df, valid_df = _split_training_data(training_df)
     candidates = _fit_candidate_models(train_df)
@@ -313,6 +335,7 @@ def run_historical_kalshi_backtest(
     )
     if training_df.empty:
         return {"status": "insufficient_data", "rows": 0, "message": "Training dataset is empty."}
+    _require_feature_columns(training_df)
 
     training_dates = pd.to_datetime(training_df["game_date"])
     train_df = training_df[training_dates.between(pd.Timestamp(train_start_date), pd.Timestamp(train_end_date))].copy()
@@ -448,6 +471,7 @@ def analyze_forward_feature_selection(training_df: pd.DataFrame) -> dict[str, ob
         raise ValueError("Training dataset is empty.")
     if training_df["target_home_win"].nunique() < 2:
         raise ValueError("Training dataset must contain both classes.")
+    _require_feature_columns(training_df)
 
     train_df, valid_df = _split_training_data(training_df)
     aic_steps, best_aic = _forward_select_features(train_df, criterion="aic")
@@ -472,6 +496,8 @@ def benchmark_game_outcome_models(
 ) -> dict[str, object]:
     if train_df.empty or valid_df.empty:
         raise ValueError("Training and validation frames must be non-empty.")
+    _require_feature_columns(train_df)
+    _require_feature_columns(valid_df)
 
     if trained_models is None:
         models = _fit_candidate_models(train_df)
@@ -674,6 +700,7 @@ def build_live_feature_frame(
 def predict_home_win_probabilities(bundle: dict[str, object], features_df: pd.DataFrame) -> pd.DataFrame:
     if features_df.empty:
         return pd.DataFrame()
+    _require_feature_columns(features_df)
     result = features_df.copy()
     if bundle.get("bayes_evidence_pipeline") is not None and bundle.get("bayes_base_rate") is not None:
         result["home_win_prob"] = _bayesian_posterior_probabilities(bundle, result)
@@ -685,6 +712,7 @@ def predict_home_win_probabilities(bundle: dict[str, object], features_df: pd.Da
 
 
 def _fit_candidate_models(train_df: pd.DataFrame) -> dict[str, Pipeline]:
+    _require_feature_columns(train_df)
     models = {
         LOGISTIC_MODEL_NAME: _build_logistic_pipeline(),
         HISTGB_MODEL_NAME: _build_histgb_pipeline(),
@@ -697,6 +725,7 @@ def _fit_candidate_models(train_df: pd.DataFrame) -> dict[str, Pipeline]:
 
 
 def _train_bayesian_bundle(train_df: pd.DataFrame) -> dict[str, object]:
+    _require_feature_columns(train_df)
     base_rate = float(np.clip(train_df["target_home_win"].mean(), 1e-6, 1 - 1e-6))
     pipeline = _build_logistic_pipeline(BAYES_EVIDENCE_FEATURE_COLUMNS)
     pipeline.fit(train_df[BAYES_EVIDENCE_FEATURE_COLUMNS], train_df["target_home_win"])
@@ -706,6 +735,7 @@ def _train_bayesian_bundle(train_df: pd.DataFrame) -> dict[str, object]:
 def _bayesian_posterior_probabilities(bundle: dict[str, object], frame: pd.DataFrame) -> np.ndarray:
     evidence_pipeline = bundle["bayes_evidence_pipeline"] if "bayes_evidence_pipeline" in bundle else bundle["pipeline"]
     evidence_columns = bundle.get("bayes_evidence_feature_columns", BAYES_EVIDENCE_FEATURE_COLUMNS)
+    _require_columns(frame, evidence_columns, frame_name="bayesian evidence frame")
     evidence_probabilities = np.clip(
         np.asarray(evidence_pipeline.predict_proba(frame[evidence_columns]), dtype=float)[:, 1],
         1e-6,
@@ -723,6 +753,7 @@ def _bayesian_posterior_probabilities(bundle: dict[str, object], frame: pd.DataF
 
 
 def _bayesian_prior_probabilities(frame: pd.DataFrame, default: float = 0.5) -> np.ndarray:
+    _require_columns(frame, ["market_home_implied_prob"], frame_name="bayesian prior frame")
     market_prior = np.clip(frame["market_home_implied_prob"].to_numpy(dtype=float), 1e-6, 1 - 1e-6)
     neutral_mask = np.isclose(market_prior, default, atol=1e-9)
     if "elo_home_win_prob" not in frame.columns:
@@ -958,6 +989,19 @@ def _split_training_data(training_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Da
     return ordered.iloc[:split_index].copy(), ordered.iloc[split_index:].copy()
 
 
+def _require_feature_columns(frame: pd.DataFrame) -> None:
+    _require_columns(frame, FEATURE_COLUMNS, frame_name="feature frame")
+
+
+def _require_columns(frame: pd.DataFrame, columns: list[str], frame_name: str) -> None:
+    duplicate_columns = sorted({column for column in columns if columns.count(column) > 1})
+    if duplicate_columns:
+        raise ValueError(f"Duplicate required columns in {frame_name}: {', '.join(duplicate_columns)}")
+    missing_columns = [column for column in columns if column not in frame.columns]
+    if missing_columns:
+        raise ValueError(f"Missing required columns in {frame_name}: {', '.join(missing_columns)}")
+
+
 def _classification_metrics(target: pd.Series, probabilities: np.ndarray | pd.Series) -> dict[str, float]:
     clipped = np.clip(np.asarray(probabilities, dtype=float), 1e-6, 1 - 1e-6)
     predictions = (clipped >= 0.5).astype(int)
@@ -1056,6 +1100,7 @@ def _build_game_features(
 
 
 def _snapshot_team(history: list[dict[str, object]], venue_home: bool, elo_rating: float) -> TeamSnapshot:
+    history = sorted(history, key=lambda game: (pd.Timestamp(game["game_date"]), str(game.get("game_id", ""))))
     games_played = len(history)
     wins = sum(1 for game in history if game["won"])
     recent = history[-RECENT_GAMES_WINDOW:]

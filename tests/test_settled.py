@@ -220,3 +220,59 @@ def test_run_settled_window_report_builds_window_metrics(monkeypatch) -> None:
     assert windows["last_7d"]["games"] == 2
     assert windows["last_30d"]["games"] == 2
     assert len(result["daily"]) == 2
+
+
+def test_run_settled_prediction_report_parameterizes_model_name(monkeypatch) -> None:
+    db_path = _workspace_db_path("settled-params")
+    monkeypatch.setenv("DUCKDB_PATH", str(db_path))
+    settings.cache_clear()
+
+    conn = connect(settings().duckdb_path)
+    append_dataframe(
+        conn,
+        "games",
+        pd.DataFrame(
+            [
+                {
+                    "game_id": "g1",
+                    "game_date": "2026-04-14",
+                    "event_start_time": "2026-04-14T18:00:00",
+                    "away_team": "Away",
+                    "home_team": "Home",
+                    "snapshot_ts": "2026-04-14T12:00:00",
+                    "collection_run_ts": "2026-04-14T12:00:00",
+                }
+            ]
+        ),
+    )
+    append_dataframe(
+        conn,
+        "model_predictions",
+        pd.DataFrame(
+            [
+                {
+                    "game_id": "g1",
+                    "snapshot_ts": "2026-04-14T17:00:00",
+                    "collection_run_ts": "2026-04-14T17:00:00",
+                    "team": "Home",
+                    "model_name": "safe_model",
+                    "model_prob": 0.7,
+                    "games_played_floor_pass": True,
+                }
+            ]
+        ),
+    )
+    append_dataframe(
+        conn,
+        "game_results",
+        pd.DataFrame(
+            [
+                {"game_id": "g1", "game_date": "2026-04-14", "away_team": "Away", "home_team": "Home", "winner_team": "Home", "away_score": 1, "home_score": 2}
+            ]
+        ),
+    )
+    conn.close()
+
+    result = run_settled_prediction_report("2026-04-14", "2026-04-14", model_name="safe_model' OR 1=1 --")
+
+    assert result == {"status": "insufficient_data", "rows": 0}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from datetime import UTC, date, datetime, timedelta
@@ -10,6 +11,8 @@ from mlpm.config.settings import settings
 from mlpm.ingest.mlb_stats import fetch_final_results
 from mlpm.pipeline.collect import collect_snapshot
 from mlpm.storage.duckdb import append_dataframe, connect, replace_dataframe
+
+logger = logging.getLogger(__name__)
 
 
 def sync_recent_game_results(
@@ -85,7 +88,7 @@ def run_service(iterations: int = 0) -> None:
                 status="ok",
                 counts=counts,
             )
-            print({"run_id": run_id, "status": "ok", **counts}, flush=True)
+            logger.info("Collector run completed run_id=%s status=ok counts=%s", run_id, counts)
             count += 1
             sleep_seconds = max(
                 0.0,
@@ -102,9 +105,10 @@ def run_service(iterations: int = 0) -> None:
                 status="stopped",
                 error_message="Interrupted by operator",
             )
-            print(
-                {"run_id": run_id, "status": "stopped", "reason": "Interrupted by operator"},
-                flush=True,
+            logger.info(
+                "Collector run stopped run_id=%s status=stopped reason=%s",
+                run_id,
+                "Interrupted by operator",
             )
             return
         except Exception as exc:
@@ -116,8 +120,5 @@ def run_service(iterations: int = 0) -> None:
                 status="error",
                 error_message=str(exc),
             )
-            print(
-                {"run_id": run_id, "status": "error", "error": str(exc)},
-                flush=True,
-            )
+            logger.exception("Collector run failed run_id=%s status=error", run_id)
             time.sleep(cfg.runner_failure_backoff_seconds)
