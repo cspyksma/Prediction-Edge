@@ -42,6 +42,13 @@ def append_historical_import_run(
     request_count: int,
     payload_count: int,
     normalized_rows: int,
+    games_total: int | None = None,
+    games_with_markets: int | None = None,
+    games_with_pregame_quotes: int | None = None,
+    candidate_markets: int | None = None,
+    empty_payload_count: int | None = None,
+    rate_limited_count: int | None = None,
+    parse_error_count: int | None = None,
     error_message: str | None = None,
 ) -> None:
     conn = connect(settings().duckdb_path)
@@ -62,6 +69,13 @@ def append_historical_import_run(
                         "request_count": request_count,
                         "payload_count": payload_count,
                         "normalized_rows": normalized_rows,
+                        "games_total": games_total,
+                        "games_with_markets": games_with_markets,
+                        "games_with_pregame_quotes": games_with_pregame_quotes,
+                        "candidate_markets": candidate_markets,
+                        "empty_payload_count": empty_payload_count,
+                        "rate_limited_count": rate_limited_count,
+                        "parse_error_count": parse_error_count,
                         "error_message": error_message,
                     }
                 ]
@@ -101,6 +115,11 @@ def has_successful_import_run(source: str, start_date: str, end_date: str) -> bo
               AND start_date = DATE '{start_date}'
               AND end_date = DATE '{end_date}'
               AND status = 'ok'
+              AND (
+                    games_with_pregame_quotes IS NULL
+                    OR games_total = 0
+                    OR COALESCE(games_with_pregame_quotes, 0) > 0
+                  )
             LIMIT 1
             """,
         )

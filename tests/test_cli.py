@@ -4,6 +4,7 @@ from mlpm.cli import (
     _format_bet_opportunity_output,
     _format_benchmark_game_model_output,
     _format_historical_import_output,
+    _format_historical_backtest_output,
     _format_historical_status_output,
     _format_settled_prediction_output,
     _format_settled_window_output,
@@ -170,6 +171,7 @@ def test_format_historical_import_output_includes_counts() -> None:
     assert "import_run_id: run-1" in output
     assert "normalized_rows: 100" in output
     assert "chunks_skipped: 1" in output
+    assert "games_with_pregame_quotes: 0" not in output
 
 
 def test_format_historical_status_output_includes_table() -> None:
@@ -179,7 +181,19 @@ def test_format_historical_status_output_includes_table() -> None:
             "rows": 2,
             "sources": {
                 "polymarket": {"import_runs": 1, "request_count": 3, "payload_count": 3, "normalized_rows": 120},
-                "kalshi": {"import_runs": 1, "request_count": 5, "payload_count": 5, "normalized_rows": 80},
+                "kalshi": {
+                    "import_runs": 1,
+                    "request_count": 5,
+                    "payload_count": 5,
+                    "normalized_rows": 80,
+                    "games_total": 7,
+                    "games_with_markets": 5,
+                    "games_with_pregame_quotes": 4,
+                    "candidate_markets": 10,
+                    "empty_payload_count": 1,
+                    "rate_limited_count": 1,
+                    "parse_error_count": 0,
+                },
             },
         }
     )
@@ -187,3 +201,25 @@ def test_format_historical_status_output_includes_table() -> None:
     assert "Historical Import Status" in output
     assert "rows: 2" in output
     assert "polymarket" in output
+
+
+def test_format_historical_backtest_output_includes_roi_metrics() -> None:
+    output = _format_historical_backtest_output(
+        {
+            "status": "ok",
+            "rows": 20,
+            "rows_train": 16,
+            "rows_valid": 4,
+            "replay_rows": 20,
+            "valid_replay_rows": 4,
+            "champion_model": "mlb_win_bayes_v1",
+            "benchmarks": {
+                "mlb_win_bayes_v1": {"roi": 0.12, "units_won": 0.48, "bets": 4, "log_loss": 0.61},
+            },
+            "calibration": [{"model_name": "mlb_win_bayes_v1"}],
+        }
+    )
+
+    assert "Historical Kalshi Backtest" in output
+    assert "champion_model: mlb_win_bayes_v1" in output
+    assert "calibration_rows: 1" in output

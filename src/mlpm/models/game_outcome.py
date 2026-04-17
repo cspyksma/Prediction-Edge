@@ -283,6 +283,134 @@ def run_model_benchmark(start_date: str, end_date: str) -> dict[str, object]:
     }
 
 
+def run_historical_kalshi_backtest(start_date: str, end_date: str) -> dict[str, object]:
+    from mlpm.evaluation.strategy import build_bet_opportunities
+    from mlpm.historical.replay import build_kalshi_replay_quote_rows, load_kalshi_pregame_replay
+
+    replay_df = load_kalshi_pregame_replay(start_date, end_date)
+    if replay_df.empty:
+        return {"status": "insufficient_data", "rows": 0, "message": "No replay-selected Kalshi pregame quotes found."}
+
+    results_df = fetch_final_results(start_date, end_date)
+    pitching_logs_df = fetch_game_pitching_logs(start_date, end_date)
+    batting_logs_df = fetch_game_batting_logs(start_date, end_date)
+    market_priors_df = replay_df[["game_id", "home_market_prob"]].rename(columns={"home_market_prob": "market_home_implied_prob"})
+    training_df = build_training_dataset(
+        results_df,
+        pitching_logs_df,
+        batting_logs_df=batting_logs_df,
+        market_priors_df=market_priors_df,
+    )
+    if training_df.empty:
+        return {"status": "insufficient_data", "rows": 0, "message": "Training dataset is empty."}
+
+    train_df, valid_df = _split_training_data(training_df)
+    valid_replay = replay_df[replay_df["game_id"].isin(valid_df["game_id"])].copy()
+    if valid_replay.empty:
+        return {"status": "insufficient_data", "rows": 0, "message": "Validation slice has no replay-selected Kalshi quotes."}
+
+    valid_games = valid_replay[["game_id", "game_date", "event_start_time", "home_team", "away_team"]].copy()
+    replay_quotes = pd.DataFrame(build_kalshi_replay_quote_rows(valid_replay))
+    results_lookup = results_df.copy()
+    for column in ("away_score", "home_score"):
+        if column not in results_lookup.columns:
+            results_lookup[column] = None
+    results_lookup = results_lookup[["game_id", "winner_team", "away_score", "home_score"]].drop_duplicates(subset=["game_id"])
+
+    candidates = _fit_candidate_models(train_df)
+    bayes_bundle = _train_bayesian_bundle(train_df)
+    model_probabilities: dict[str, np.ndarray] = {
+        name: np.asarray(pipeline.predict_proba(valid_df[FEATURE_COLUMNS]), dtype=float)[:, 1]
+        for name, pipeline in candidates.items()
+    }
+    model_probabilities[BAYES_MODEL_NAME] = _bayesian_posterior_probabilities(
+        {
+            "pipeline": bayes_bundle["pipeline"],
+            "bayes_evidence_pipeline": bayes_bundle["pipeline"],
+            "bayes_base_rate": bayes_bundle["base_rate"],
+            "bayes_prior_default": 0.5,
+            "bayes_evidence_feature_columns": BAYES_EVIDENCE_FEATURE_COLUMNS,
+        },
+        valid_df,
+    )
+
+    metrics_by_model: dict[str, dict[str, float]] = {}
+    opportunities_by_model: dict[str, pd.DataFrame] = {}
+    calibration_rows: list[dict[str, object]] = []
+    for model_name, probabilities in model_probabilities.items():
+        metrics = _classification_metrics(valid_df["target_home_win"], probabilities)
+        calibration_rows.extend(_calibration_table(valid_df["target_home_win"], probabilities, model_name).to_dict(orient="records"))
+
+        prediction_rows: list[dict[str, object]] = []
+        for row, home_probability in zip(valid_df.to_dict(orient="records"), probabilities, strict=False):
+            snapshot_ts = valid_replay.loc[valid_replay["game_id"] == row["game_id"], "snapshot_ts"].iloc[0]
+            prediction_rows.append(
+                {
+                    "game_id": row["game_id"],
+                    "snapshot_ts": snapshot_ts,
+                    "collection_run_ts": snapshot_ts,
+                    "team": row["home_team"],
+                    "opponent_team": row["away_team"],
+                    "model_name": model_name,
+                    "model_prob": float(home_probability),
+                }
+            )
+            prediction_rows.append(
+                {
+                    "game_id": row["game_id"],
+                    "snapshot_ts": snapshot_ts,
+                    "collection_run_ts": snapshot_ts,
+                    "team": row["away_team"],
+                    "opponent_team": row["home_team"],
+                    "model_name": model_name,
+                    "model_prob": float(1.0 - home_probability),
+                }
+            )
+
+        model_predictions = pd.DataFrame(prediction_rows)
+        opportunities = build_bet_opportunities(valid_games, replay_quotes, model_predictions)
+        settled = opportunities.merge(results_lookup, on="game_id", how="left")
+        if not settled.empty:
+            settled["won_bet"] = settled["winner_team"].eq(settled["team"])
+            settled["realized_return_units"] = np.where(
+                settled["won_bet"],
+                (settled["implied_decimal_odds"] - 1.0) * settled["stake_units"],
+                -1.0 * settled["stake_units"],
+            )
+            actionable = settled[settled["is_actionable"]].copy()
+        else:
+            actionable = settled
+
+        bets = int(len(actionable))
+        units_won = float(actionable["realized_return_units"].sum()) if bets else 0.0
+        roi = float(units_won / bets) if bets else 0.0
+        avg_edge_bps = float(actionable["edge_bps"].mean()) if bets else 0.0
+        metrics_by_model[model_name] = {
+            **metrics,
+            "bets": bets,
+            "units_won": units_won,
+            "roi": roi,
+            "avg_edge_bps": avg_edge_bps,
+        }
+        opportunities_by_model[model_name] = actionable
+
+    champion_model = max(
+        metrics_by_model,
+        key=lambda name: (metrics_by_model[name]["roi"], metrics_by_model[name]["units_won"], -metrics_by_model[name]["log_loss"]),
+    )
+    return {
+        "status": "ok",
+        "rows": len(valid_df),
+        "rows_train": len(train_df),
+        "rows_valid": len(valid_df),
+        "replay_rows": len(replay_df),
+        "valid_replay_rows": len(valid_replay),
+        "champion_model": champion_model,
+        "benchmarks": metrics_by_model,
+        "calibration": calibration_rows,
+    }
+
+
 def run_forward_feature_selection(start_date: str, end_date: str) -> dict[str, object]:
     results_df, pitching_logs_df, batting_logs_df, market_priors_df = fetch_training_inputs(start_date, end_date)
     training_df = build_training_dataset(results_df, pitching_logs_df, batting_logs_df=batting_logs_df, market_priors_df=market_priors_df)
@@ -555,7 +683,7 @@ def _bayesian_posterior_probabilities(bundle: dict[str, object], frame: pd.DataF
     evidence_pipeline = bundle["bayes_evidence_pipeline"] if "bayes_evidence_pipeline" in bundle else bundle["pipeline"]
     evidence_columns = bundle.get("bayes_evidence_feature_columns", BAYES_EVIDENCE_FEATURE_COLUMNS)
     evidence_probabilities = np.clip(
-        evidence_pipeline.predict_proba(frame[evidence_columns])[:, 1],
+        np.asarray(evidence_pipeline.predict_proba(frame[evidence_columns]), dtype=float)[:, 1],
         1e-6,
         1 - 1e-6,
     )
@@ -809,11 +937,20 @@ def _split_training_data(training_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Da
 def _classification_metrics(target: pd.Series, probabilities: np.ndarray | pd.Series) -> dict[str, float]:
     clipped = np.clip(np.asarray(probabilities, dtype=float), 1e-6, 1 - 1e-6)
     predictions = (clipped >= 0.5).astype(int)
+    target_array = target.to_numpy(dtype=int)
+    if pd.Series(target_array).nunique() < 2:
+        actual = float(target_array[0]) if len(target_array) else 0.0
+        return {
+            "accuracy": float((predictions == target_array).mean()) if len(target_array) else 0.0,
+            "roc_auc": 0.5,
+            "log_loss": float(log_loss(target_array, clipped, labels=[0, 1])) if len(target_array) else 0.0,
+            "brier_score": float(np.mean(np.square(clipped - actual))) if len(target_array) else 0.0,
+        }
     return {
-        "accuracy": float((predictions == target.to_numpy()).mean()),
-        "roc_auc": float(roc_auc_score(target, clipped)),
-        "log_loss": float(log_loss(target, clipped)),
-        "brier_score": float(brier_score_loss(target, clipped)),
+        "accuracy": float((predictions == target_array).mean()),
+        "roc_auc": float(roc_auc_score(target_array, clipped)),
+        "log_loss": float(log_loss(target_array, clipped)),
+        "brier_score": float(brier_score_loss(target_array, clipped)),
     }
 
 

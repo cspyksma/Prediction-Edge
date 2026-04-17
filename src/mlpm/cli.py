@@ -14,6 +14,7 @@ from mlpm.historical.kalshi_backfill import backfill_kalshi_history_for_games
 from mlpm.historical.polymarket_backfill import backfill_polymarket_history_for_games
 from mlpm.historical.status import run_historical_import_status
 from mlpm.models.game_outcome import (
+    run_historical_kalshi_backtest,
     run_forward_feature_selection,
     run_model_benchmark,
     train_and_save_model,
@@ -73,6 +74,10 @@ def _build_parser() -> argparse.ArgumentParser:
     historical_status = subparsers.add_parser("historical-import-status", help="Show historical import status by source.")
     historical_status.add_argument("--start-date", required=True)
     historical_status.add_argument("--end-date", required=True)
+
+    historical_backtest = subparsers.add_parser("historical-backtest-kalshi", help="Backtest tabular models against replay-selected Kalshi pregame quotes.")
+    historical_backtest.add_argument("--start-date", required=True)
+    historical_backtest.add_argument("--end-date", required=True)
 
     backtest = subparsers.add_parser("backtest", help="Run a simple backtest over stored data.")
     backtest.add_argument("--start-date", required=True)
@@ -389,6 +394,17 @@ def _format_historical_import_output(result: dict[str, Any]) -> str:
         f"payload_count: {result['payload_count']}",
         f"normalized_rows: {result['normalized_rows']}",
     ]
+    for key in (
+        "games_total",
+        "games_with_markets",
+        "games_with_pregame_quotes",
+        "candidate_markets",
+        "empty_payload_count",
+        "rate_limited_count",
+        "parse_error_count",
+    ):
+        if key in result:
+            lines.append(f"{key}: {result[key]}")
     if "chunks_total" in result:
         lines.extend(
             [
@@ -409,6 +425,26 @@ def _format_historical_status_output(result: dict[str, Any]) -> str:
         "",
         _format_metrics_table("Historical Import Status", result.get("sources", {})),
     ]
+    return "\n".join(lines)
+
+
+def _format_historical_backtest_output(result: dict[str, Any]) -> str:
+    if result.get("status") != "ok":
+        return str(result)
+    lines = [
+        f"status: {result['status']}",
+        f"rows: {result['rows']}",
+        f"rows_train: {result['rows_train']}",
+        f"rows_valid: {result['rows_valid']}",
+        f"replay_rows: {result['replay_rows']}",
+        f"valid_replay_rows: {result['valid_replay_rows']}",
+        f"champion_model: {result['champion_model']}",
+        "",
+        _format_metrics_table("Historical Kalshi Backtest", result.get("benchmarks", {})),
+    ]
+    calibration = result.get("calibration", [])
+    if calibration:
+        lines.extend(["", f"calibration_rows: {len(calibration)}"])
     return "\n".join(lines)
 
 
@@ -491,6 +527,10 @@ def app() -> None:
 
     if args.command == "historical-import-status":
         print(_format_historical_status_output(run_historical_import_status(args.start_date, args.end_date)))
+        return
+
+    if args.command == "historical-backtest-kalshi":
+        print(_format_historical_backtest_output(run_historical_kalshi_backtest(args.start_date, args.end_date)))
         return
 
     if args.command == "backtest":

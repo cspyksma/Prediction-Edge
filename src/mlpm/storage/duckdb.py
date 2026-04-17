@@ -47,6 +47,13 @@ CREATE TABLE IF NOT EXISTS historical_import_runs (
     request_count INTEGER,
     payload_count INTEGER,
     normalized_rows INTEGER,
+    games_total INTEGER,
+    games_with_markets INTEGER,
+    games_with_pregame_quotes INTEGER,
+    candidate_markets INTEGER,
+    empty_payload_count INTEGER,
+    rate_limited_count INTEGER,
+    parse_error_count INTEGER,
     error_message VARCHAR
 );
 
@@ -226,6 +233,13 @@ MIGRATION_SQL = [
     "ALTER TABLE historical_import_runs ADD COLUMN IF NOT EXISTS request_count INTEGER",
     "ALTER TABLE historical_import_runs ADD COLUMN IF NOT EXISTS payload_count INTEGER",
     "ALTER TABLE historical_import_runs ADD COLUMN IF NOT EXISTS normalized_rows INTEGER",
+    "ALTER TABLE historical_import_runs ADD COLUMN IF NOT EXISTS games_total INTEGER",
+    "ALTER TABLE historical_import_runs ADD COLUMN IF NOT EXISTS games_with_markets INTEGER",
+    "ALTER TABLE historical_import_runs ADD COLUMN IF NOT EXISTS games_with_pregame_quotes INTEGER",
+    "ALTER TABLE historical_import_runs ADD COLUMN IF NOT EXISTS candidate_markets INTEGER",
+    "ALTER TABLE historical_import_runs ADD COLUMN IF NOT EXISTS empty_payload_count INTEGER",
+    "ALTER TABLE historical_import_runs ADD COLUMN IF NOT EXISTS rate_limited_count INTEGER",
+    "ALTER TABLE historical_import_runs ADD COLUMN IF NOT EXISTS parse_error_count INTEGER",
     "ALTER TABLE historical_import_runs ADD COLUMN IF NOT EXISTS error_message VARCHAR",
     "ALTER TABLE historical_polymarket_quotes ADD COLUMN IF NOT EXISTS import_run_id VARCHAR",
     "ALTER TABLE historical_polymarket_quotes ADD COLUMN IF NOT EXISTS source VARCHAR",
@@ -536,6 +550,13 @@ SELECT
     SUM(request_count) AS request_count,
     SUM(payload_count) AS payload_count,
     SUM(normalized_rows) AS normalized_rows,
+    SUM(games_total) AS games_total,
+    SUM(games_with_markets) AS games_with_markets,
+    SUM(games_with_pregame_quotes) AS games_with_pregame_quotes,
+    SUM(candidate_markets) AS candidate_markets,
+    SUM(empty_payload_count) AS empty_payload_count,
+    SUM(rate_limited_count) AS rate_limited_count,
+    SUM(parse_error_count) AS parse_error_count,
     MAX(completed_at) AS last_completed_at
 FROM historical_import_runs
 GROUP BY source, start_date, end_date;

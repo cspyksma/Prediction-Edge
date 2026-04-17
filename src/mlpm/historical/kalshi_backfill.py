@@ -19,10 +19,12 @@ from mlpm.historical.common import (
 from mlpm.historical.normalize_kalshi_history import normalize_kalshi_candle_payload
 from mlpm.ingest.kalshi import KALSHI_MLB_GAME_SERIES
 from mlpm.ingest.mlb_stats import fetch_final_results
-from mlpm.normalize.mapping import canonicalize_team_name
+from mlpm.normalize.mapping import canonicalize_team_name, team_aliases
 from mlpm.storage.duckdb import connect, replace_dataframe
 
 KALSHI_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+KALSHI_MARKETS_URL = f"{KALSHI_BASE_URL}/markets"
+KALSHI_CANDLES_URL = f"{KALSHI_BASE_URL}/series/{KALSHI_MLB_GAME_SERIES}/markets/{{ticker}}/candlesticks"
 KALSHI_HISTORICAL_CUTOFF_URL = f"{KALSHI_BASE_URL}/historical/cutoff"
 KALSHI_HISTORICAL_MARKETS_URL = f"{KALSHI_BASE_URL}/historical/markets"
 KALSHI_HISTORICAL_CANDLES_URL = f"{KALSHI_BASE_URL}/historical/markets/{{ticker}}/candlesticks"
@@ -82,6 +84,13 @@ def backfill_kalshi_history_for_games(
         "request_count": 0,
         "payload_count": 0,
         "normalized_rows": 0,
+        "games_total": 0,
+        "games_with_markets": 0,
+        "games_with_pregame_quotes": 0,
+        "candidate_markets": 0,
+        "empty_payload_count": 0,
+        "rate_limited_count": 0,
+        "parse_error_count": 0,
         "chunks_total": 0,
         "chunks_completed": 0,
         "chunks_skipped": 0,
@@ -100,6 +109,13 @@ def backfill_kalshi_history_for_games(
         totals["request_count"] += int(result["request_count"])
         totals["payload_count"] += int(result["payload_count"])
         totals["normalized_rows"] += int(result["normalized_rows"])
+        totals["games_total"] += int(result.get("games_total", 0))
+        totals["games_with_markets"] += int(result.get("games_with_markets", 0))
+        totals["games_with_pregame_quotes"] += int(result.get("games_with_pregame_quotes", 0))
+        totals["candidate_markets"] += int(result.get("candidate_markets", 0))
+        totals["empty_payload_count"] += int(result.get("empty_payload_count", 0))
+        totals["rate_limited_count"] += int(result.get("rate_limited_count", 0))
+        totals["parse_error_count"] += int(result.get("parse_error_count", 0))
         totals["chunks_completed"] += 1
     return totals
 
@@ -115,10 +131,18 @@ def _backfill_kalshi_history_chunk(
     request_count = 0
     payload_count = 0
     normalized_rows: list[dict] = []
+    games_total = 0
+    games_with_markets = 0
+    games_with_pregame_quotes = 0
+    candidate_markets = 0
+    empty_payload_count = 0
+    rate_limited_count = 0
+    parse_error_count = 0
     error_message: str | None = None
     status = "ok"
     try:
         games = fetch_final_results(start_date, end_date)
+        games_total = int(len(games))
         if games.empty:
             return {
                 "status": status,
@@ -126,11 +150,18 @@ def _backfill_kalshi_history_chunk(
                 "request_count": request_count,
                 "payload_count": payload_count,
                 "normalized_rows": 0,
+                "games_total": games_total,
+                "games_with_markets": games_with_markets,
+                "games_with_pregame_quotes": games_with_pregame_quotes,
+                "candidate_markets": candidate_markets,
+                "empty_payload_count": empty_payload_count,
+                "rate_limited_count": rate_limited_count,
+                "parse_error_count": parse_error_count,
             }
-        get_kalshi_historical_cutoff()
-        candidates = build_kalshi_ticker_candidates(games)
-        if candidates.empty:
-            candidates = discover_kalshi_markets_for_games(games)
+        historical_cutoff = get_kalshi_historical_cutoff()
+        candidates = discover_kalshi_markets_for_games(games, historical_cutoff=historical_cutoff)
+        candidate_markets = int(len(candidates))
+        games_with_markets = int(candidates["game_id"].nunique()) if not candidates.empty else 0
         if candidates.empty:
             return {
                 "status": status,
@@ -138,44 +169,80 @@ def _backfill_kalshi_history_chunk(
                 "request_count": request_count,
                 "payload_count": payload_count,
                 "normalized_rows": 0,
+                "games_total": games_total,
+                "games_with_markets": games_with_markets,
+                "games_with_pregame_quotes": games_with_pregame_quotes,
+                "candidate_markets": candidate_markets,
+                "empty_payload_count": empty_payload_count,
+                "rate_limited_count": rate_limited_count,
+                "parse_error_count": parse_error_count,
             }
         with httpx.Client(timeout=30.0) as client:
             for row in candidates.to_dict(orient="records"):
-                market_payload = fetch_kalshi_historical_market(row["ticker"], client=client)
-                if not market_payload:
+                historical_mode = _should_use_historical_market(row, historical_cutoff)
+                market_payload, market_status = fetch_kalshi_market(
+                    row["ticker"],
+                    client=client,
+                    historical=historical_mode,
+                )
+                if market_status == "rate_limited":
+                    rate_limited_count += 1
+                elif market_status != "ok":
+                    empty_payload_count += 1
+                market = _extract_market_payload(market_payload)
+                if not market:
                     continue
                 request_count += 1
                 payload_count += 1
+                row = _enrich_candidate_with_market(row, market)
                 market_path = build_historical_payload_path("kalshi", "markets", row["day_key"], row["ticker"])
                 write_historical_payload(market_path, market_payload)
 
-                candle_payload = fetch_kalshi_historical_candles(
+                start_ts, end_ts = _market_query_window(row, market)
+                candle_payload, candle_status = fetch_kalshi_candles(
                     row["ticker"],
-                    _game_window_start_ts(start_date),
-                    _game_window_end_ts(end_date),
+                    start_ts,
+                    end_ts,
                     period_interval=period_interval,
                     client=client,
+                    historical=historical_mode,
                 )
+                if candle_status == "rate_limited":
+                    rate_limited_count += 1
+                elif candle_status != "ok":
+                    empty_payload_count += 1
                 if not candle_payload:
                     continue
                 request_count += 1
                 payload_count += 1
                 candle_path = build_historical_payload_path("kalshi", "candles", row["day_key"], row["ticker"])
                 write_historical_payload(candle_path, candle_payload)
-                candle_rows = normalize_kalshi_candle_payload(candle_payload, row["ticker"], game_id=row["game_id"])
+                try:
+                    candle_rows = normalize_kalshi_candle_payload(
+                        candle_payload,
+                        {
+                            "import_run_id": import_run_id,
+                            "event_id": row.get("event_id"),
+                            "ticker": row.get("ticker"),
+                            "market_id": row.get("market_id") or row.get("ticker"),
+                            "game_id": row.get("game_id"),
+                            "event_start_time": row.get("event_start_time"),
+                            "outcome_team": row.get("outcome_team"),
+                            "home_team": row.get("home_team"),
+                            "away_team": row.get("away_team"),
+                            "raw_payload_path": str(candle_path),
+                        },
+                    )
+                except (TypeError, ValueError):
+                    parse_error_count += 1
+                    continue
                 for candle_row in candle_rows:
-                    candle_row["import_run_id"] = import_run_id
-                    candle_row["event_id"] = row.get("event_id")
-                    candle_row["ticker"] = row.get("ticker")
-                    candle_row["event_start_time"] = row.get("event_start_time")
-                    candle_row["outcome_team"] = row.get("outcome_team")
                     candle_row["side"] = candle_row.get("side") or _infer_side_from_row(row)
-                    candle_row["raw_payload_path"] = str(candle_path)
                 normalized_rows.extend(candle_rows)
                 if include_trades:
                     trades_payload = fetch_kalshi_historical_trades(
-                        _game_window_start_ts(start_date),
-                        _game_window_end_ts(end_date),
+                        start_ts,
+                        end_ts,
                         ticker=row["ticker"],
                         client=client,
                     )
@@ -184,6 +251,13 @@ def _backfill_kalshi_history_chunk(
                     trade_path = build_historical_payload_path("kalshi", "trades", row["day_key"], row["ticker"])
                     write_historical_payload(trade_path, trades_payload)
         _write_historical_kalshi_rows(normalized_rows)
+        games_with_pregame_quotes = len(
+            {
+                str(row["game_id"])
+                for row in normalized_rows
+                if row.get("game_id") and bool(row.get("pre_pitch_flag"))
+            }
+        )
     except Exception as exc:
         status = "error"
         error_message = str(exc)
@@ -200,6 +274,13 @@ def _backfill_kalshi_history_chunk(
             request_count=request_count,
             payload_count=payload_count,
             normalized_rows=len(normalized_rows),
+            games_total=games_total,
+            games_with_markets=games_with_markets,
+            games_with_pregame_quotes=games_with_pregame_quotes,
+            candidate_markets=candidate_markets,
+            empty_payload_count=empty_payload_count,
+            rate_limited_count=rate_limited_count,
+            parse_error_count=parse_error_count,
             error_message=error_message,
         )
     return {
@@ -208,45 +289,63 @@ def _backfill_kalshi_history_chunk(
         "request_count": request_count,
         "payload_count": payload_count,
         "normalized_rows": len(normalized_rows),
+        "games_total": games_total,
+        "games_with_markets": games_with_markets,
+        "games_with_pregame_quotes": games_with_pregame_quotes,
+        "candidate_markets": candidate_markets,
+        "empty_payload_count": empty_payload_count,
+        "rate_limited_count": rate_limited_count,
+        "parse_error_count": parse_error_count,
     }
 
 
-def fetch_kalshi_historical_market(ticker: str, client: httpx.Client | None = None) -> dict:
+def fetch_kalshi_market(
+    ticker: str,
+    client: httpx.Client | None = None,
+    historical: bool = True,
+) -> tuple[dict, str]:
     owns_client = client is None
     client = client or httpx.Client(timeout=30.0)
     try:
-        response = client.get(f"{KALSHI_HISTORICAL_MARKETS_URL}/{ticker}")
-        if response.status_code == 404:
-            response = client.get(KALSHI_HISTORICAL_MARKETS_URL, params={"ticker": ticker, "limit": 1})
+        if historical:
+            response = client.get(f"{KALSHI_HISTORICAL_MARKETS_URL}/{ticker}")
+        else:
+            response = client.get(f"{KALSHI_MARKETS_URL}/{ticker}")
         if response.status_code in (400, 404):
-            return {}
+            response = client.get(
+                KALSHI_HISTORICAL_MARKETS_URL if historical else KALSHI_MARKETS_URL,
+                params={"tickers": ticker, "limit": 1},
+            )
+        if response.status_code in (400, 404):
+            return {}, "missing"
         if response.status_code == 429:
-            return {}
+            return {}, "rate_limited"
         response.raise_for_status()
-        return response.json()
+        return response.json(), "ok"
     finally:
         if owns_client:
             client.close()
 
 
-def fetch_kalshi_historical_candles(
+def fetch_kalshi_candles(
     ticker: str,
     start_ts: int,
     end_ts: int,
     period_interval: int = 1,
     client: httpx.Client | None = None,
-) -> dict:
+    historical: bool = True,
+) -> tuple[dict, str]:
     owns_client = client is None
     client = client or httpx.Client(timeout=30.0)
     try:
         response = client.get(
-            KALSHI_HISTORICAL_CANDLES_URL.format(ticker=ticker),
+            (KALSHI_HISTORICAL_CANDLES_URL if historical else KALSHI_CANDLES_URL).format(ticker=ticker),
             params={"start_ts": start_ts, "end_ts": end_ts, "period_interval": period_interval},
         )
         if response.status_code in (400, 404, 429):
-            return {}
+            return {}, "rate_limited" if response.status_code == 429 else "missing"
         response.raise_for_status()
-        return response.json()
+        return response.json(), "ok"
     finally:
         if owns_client:
             client.close()
@@ -272,21 +371,36 @@ def fetch_kalshi_historical_trades(
             client.close()
 
 
-def discover_kalshi_markets_for_games(games_df: pd.DataFrame, limit: int = 1000) -> pd.DataFrame:
+def discover_kalshi_markets_for_games(
+    games_df: pd.DataFrame,
+    limit: int = 200,
+    historical_cutoff: dict[str, Any] | None = None,
+) -> pd.DataFrame:
     if games_df.empty:
         return pd.DataFrame()
     game_times = _game_start_series(games_df)
     min_start = game_times.min()
     max_start = game_times.max()
+    games = games_df.copy()
+    games["event_start_dt"] = game_times
     rows: list[dict[str, object]] = []
+    seen_tickers: set[str] = set()
+    historical_mode = False
+    if historical_cutoff is not None:
+        cutoff_dt = _parse_market_time(historical_cutoff.get("market_settled_ts"))
+        historical_mode = bool(cutoff_dt is not None and max_start is not None and max_start <= cutoff_dt)
     with httpx.Client(timeout=30.0) as client:
         cursor: str | None = None
         seen_in_range = False
         while True:
             params = {"series_ticker": KALSHI_MLB_GAME_SERIES, "limit": limit}
+            if not historical_mode:
+                params["status"] = "settled"
             if cursor:
                 params["cursor"] = cursor
-            response = client.get(KALSHI_HISTORICAL_MARKETS_URL, params=params)
+            response = client.get(KALSHI_HISTORICAL_MARKETS_URL if historical_mode else KALSHI_MARKETS_URL, params=params)
+            if response.status_code == 429:
+                break
             response.raise_for_status()
             payload = response.json()
             markets = payload.get("markets", payload.get("data", []))
@@ -302,7 +416,12 @@ def discover_kalshi_markets_for_games(games_df: pd.DataFrame, limit: int = 1000)
                 if close_time is not None and min_start is not None and close_time < min_start - pd.Timedelta(days=1):
                     continue
                 page_has_in_range_market = True
-                rows.extend(_map_kalshi_market_to_games(market, games_df))
+                for mapped in _map_kalshi_market_to_games(market, games):
+                    ticker = str(mapped.get("ticker") or "")
+                    if not ticker or ticker in seen_tickers:
+                        continue
+                    seen_tickers.add(ticker)
+                    rows.append(mapped)
             if page_has_in_range_market:
                 seen_in_range = True
             cursor = payload.get("cursor")
@@ -358,13 +477,22 @@ def _map_kalshi_market_to_games(market: dict[str, Any], games_df: pd.DataFrame) 
             for key in ("title", "yes_sub_title", "no_sub_title", "event_ticker")
         )
     )
+    market_close = _parse_market_time(market.get("close_time"))
     records: list[dict[str, object]] = []
     for game in games_df.to_dict(orient="records"):
-        away_key = canonicalize_team_name(game["away_team"])
-        home_key = canonicalize_team_name(game["home_team"])
-        if away_key not in text or home_key not in text:
+        away_alias_set = _market_team_aliases(str(game["away_team"]))
+        home_alias_set = _market_team_aliases(str(game["home_team"]))
+        away_match = _text_matches_any_alias(text, away_alias_set)
+        home_match = _text_matches_any_alias(text, home_alias_set)
+        if not away_match or not home_match:
             continue
+        event_start = _parse_market_time(game.get("event_start_dt") or game.get("event_start_time"))
+        if market_close is not None and event_start is not None:
+            if abs((market_close - event_start).total_seconds()) > 8 * 3600:
+                continue
         outcome_team = _resolve_kalshi_outcome_team(market, game)
+        if outcome_team is None:
+            continue
         records.append(
             {
                 "event_id": market.get("event_ticker"),
@@ -384,9 +512,9 @@ def _map_kalshi_market_to_games(market: dict[str, Any], games_df: pd.DataFrame) 
 def _resolve_kalshi_outcome_team(market: dict[str, Any], game: dict[str, Any]) -> str | None:
     for key in ("yes_sub_title", "title"):
         value = canonicalize_team_name(str(market.get(key) or ""))
-        if canonicalize_team_name(game["home_team"]) in value:
+        if _text_matches_any_alias(value, _market_team_aliases(str(game["home_team"]))):
             return str(game["home_team"])
-        if canonicalize_team_name(game["away_team"]) in value:
+        if _text_matches_any_alias(value, _market_team_aliases(str(game["away_team"]))):
             return str(game["away_team"])
     return None
 
@@ -413,6 +541,19 @@ def _game_window_start_ts(start_date: str) -> int:
 
 def _game_window_end_ts(end_date: str) -> int:
     return int(datetime.fromisoformat(f"{end_date}T23:59:59+00:00").timestamp())
+
+
+def _market_query_window(row: dict[str, Any], market: dict[str, Any]) -> tuple[int, int]:
+    event_start = _parse_market_time(row.get("event_start_time")) or _parse_market_time(market.get("close_time"))
+    open_time = _parse_market_time(market.get("open_time"))
+    close_time = _parse_market_time(market.get("close_time"))
+    start_dt = open_time or (event_start - pd.Timedelta(days=1) if event_start is not None else None)
+    end_dt = close_time or event_start or start_dt
+    if start_dt is None or end_dt is None:
+        raise ValueError(f"Unable to determine Kalshi candle window for ticker {row.get('ticker')}")
+    if end_dt < start_dt:
+        end_dt = start_dt
+    return int(start_dt.timestamp()), int(end_dt.timestamp())
 
 
 def _infer_side_from_row(row: dict[str, object]) -> str | None:
@@ -462,3 +603,62 @@ def _game_start_series(games_df: pd.DataFrame) -> pd.Series:
         fallback = pd.to_datetime(games_df["game_date"], utc=True, errors="coerce")
         return series.fillna(fallback)
     return series
+
+
+def _extract_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    market = payload.get("market")
+    if isinstance(market, dict):
+        return market
+    markets = payload.get("markets")
+    if isinstance(markets, list):
+        for item in markets:
+            if isinstance(item, dict):
+                return item
+    return {}
+
+
+def _enrich_candidate_with_market(row: dict[str, Any], market: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(row)
+    enriched["event_id"] = market.get("event_ticker") or enriched.get("event_id")
+    enriched["market_id"] = market.get("ticker") or enriched.get("market_id") or enriched.get("ticker")
+    enriched["ticker"] = market.get("ticker") or enriched.get("ticker")
+    enriched["event_start_time"] = market.get("close_time") or enriched.get("event_start_time")
+    return enriched
+
+
+def _should_use_historical_market(row: dict[str, Any], cutoff_payload: dict[str, Any]) -> bool:
+    event_start = _parse_market_time(row.get("event_start_time"))
+    market_cutoff = _parse_market_time(cutoff_payload.get("market_settled_ts"))
+    if event_start is None or market_cutoff is None:
+        return True
+    return event_start <= market_cutoff
+
+
+def _text_matches_any_alias(text: str, aliases: set[str]) -> bool:
+    for alias in aliases:
+        if alias and alias in text:
+            return True
+    return False
+
+
+def _market_team_aliases(team_name: str) -> set[str]:
+    aliases = set(team_aliases(team_name))
+    custom_aliases = {
+        "Athletics": {"a s", "athletics", "a's"},
+        "Arizona Diamondbacks": {"arizona", "az"},
+        "Kansas City Royals": {"kansas city", "kc"},
+        "Chicago White Sox": {"chicago ws", "white sox", "cws"},
+        "Chicago Cubs": {"chicago c", "cubs", "chc"},
+        "Los Angeles Angels": {"los angeles a", "angels", "laa"},
+        "Los Angeles Dodgers": {"los angeles d", "dodgers", "lad"},
+        "New York Mets": {"new york m", "mets", "nym"},
+        "New York Yankees": {"new york y", "yankees", "nyy"},
+        "San Diego Padres": {"san diego", "sd", "padres"},
+        "San Francisco Giants": {"san francisco", "sf", "giants"},
+        "St. Louis Cardinals": {"st louis", "cardinals", "stl"},
+        "Tampa Bay Rays": {"tampa bay", "tb", "rays"},
+    }
+    aliases.update(canonicalize_team_name(alias) for alias in custom_aliases.get(team_name, set()))
+    return {alias for alias in aliases if alias}
