@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 
 import pandas as pd
 
 from mlpm.config.settings import settings
-from mlpm.evaluation.strategy import build_bet_opportunities, select_champion_model
+from mlpm.evaluation.strategy import (
+    build_bet_opportunities,
+    record_champion_selection,
+    select_champion_with_rationale,
+)
 from mlpm.features.market_priors import build_market_prior_frame
 from mlpm.ingest.base import write_raw_payload
 from mlpm.ingest.kalshi import fetch_mlb_markets
@@ -15,6 +20,8 @@ from mlpm.models.fair_value import build_model_probabilities
 from mlpm.normalize.mapping import map_kalshi_to_games, map_market_text_to_games
 from mlpm.normalize.probability import gap_to_bps, midpoint_probability
 from mlpm.storage.duckdb import append_dataframe, connect
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_ts(value: str | None) -> datetime | None:
@@ -161,12 +168,29 @@ def collect_snapshot() -> dict[str, int]:
     collection_run_ts = captured_at
 
     games_df = fetch_upcoming_games(cfg.mlb_lookahead_days)
-    kalshi_df, kalshi_payload = fetch_mlb_markets()
-    polymarket_df, polymarket_payload = fetch_polymarket_markets()
-    mapped_kalshi = map_kalshi_to_games(kalshi_df, games_df)
-    mapped_polymarket = map_market_text_to_games(polymarket_df, games_df, "question")
+    if games_df.empty:
+        logger.warning("Snapshot collection found no upcoming MLB games.")
+
+    kalshi_df = pd.DataFrame()
+    kalshi_payload: object = []
+    try:
+        kalshi_df, kalshi_payload = fetch_mlb_markets()
+        mapped_kalshi = map_kalshi_to_games(kalshi_df, games_df)
+    except Exception:
+        logger.warning("Kalshi market collection failed; continuing without Kalshi quotes.", exc_info=True)
+        mapped_kalshi = pd.DataFrame()
+
+    polymarket_df = pd.DataFrame()
+    polymarket_payload: object = []
+    try:
+        polymarket_df, polymarket_payload = fetch_polymarket_markets()
+        mapped_polymarket = map_market_text_to_games(polymarket_df, games_df, "question")
+    except Exception:
+        logger.warning("Polymarket collection failed; continuing without Polymarket quotes.", exc_info=True)
+        mapped_polymarket = pd.DataFrame()
+
     normalized_quotes = pd.concat(
-            [
+        [
             _normalize_market_quotes(mapped_kalshi, "kalshi", captured_at),
             _normalize_market_quotes(mapped_polymarket, "polymarket", captured_at),
         ],
@@ -178,7 +202,8 @@ def collect_snapshot() -> dict[str, int]:
         games_df["collection_run_ts"] = collection_run_ts
     if not model_predictions.empty:
         model_predictions["collection_run_ts"] = collection_run_ts
-    champion_model = select_champion_model()
+    champion_decision = select_champion_with_rationale()
+    champion_model = champion_decision.chosen_model
     bet_opportunities = build_bet_opportunities(
         games_df,
         normalized_quotes,
@@ -226,6 +251,10 @@ def collect_snapshot() -> dict[str, int]:
     append_dataframe(conn, "model_predictions", model_predictions)
     append_dataframe(conn, "bet_opportunities", bet_opportunities)
     append_dataframe(conn, "discrepancies", discrepancies)
+    try:
+        record_champion_selection(champion_decision, conn=conn)
+    except Exception:
+        logger.warning("Failed to record champion selection", exc_info=True)
     conn.close()
 
     return {

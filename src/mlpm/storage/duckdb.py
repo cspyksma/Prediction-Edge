@@ -194,6 +194,7 @@ CREATE TABLE IF NOT EXISTS model_predictions (
 CREATE TABLE IF NOT EXISTS game_results (
     game_id VARCHAR,
     game_date DATE,
+    event_start_time TIMESTAMP,
     away_team VARCHAR,
     home_team VARCHAR,
     winner_team VARCHAR,
@@ -215,6 +216,42 @@ CREATE TABLE IF NOT EXISTS collector_runs (
     discrepancies INTEGER,
     bet_opportunities INTEGER,
     game_results_synced INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS champion_history (
+    selected_at TIMESTAMP,
+    reference_date DATE,
+    chosen_model VARCHAR,
+    incumbent_model VARCHAR,
+    challenger_model VARCHAR,
+    action VARCHAR,
+    reason VARCHAR,
+    window_days INTEGER,
+    min_bets INTEGER,
+    confidence DOUBLE,
+    challenger_bets INTEGER,
+    challenger_roi DOUBLE,
+    challenger_units DOUBLE,
+    challenger_win_rate DOUBLE,
+    challenger_ci_lower DOUBLE,
+    challenger_ci_upper DOUBLE,
+    incumbent_bets INTEGER,
+    incumbent_roi DOUBLE,
+    incumbent_win_rate DOUBLE
+);
+
+CREATE TABLE IF NOT EXISTS feature_importances (
+    trained_at TIMESTAMP,
+    model_name VARCHAR,
+    train_start_date DATE,
+    train_end_date DATE,
+    rows_train INTEGER,
+    rows_valid INTEGER,
+    method VARCHAR,
+    feature VARCHAR,
+    importance DOUBLE,
+    importance_std DOUBLE,
+    rank INTEGER
 );
 """
 
@@ -322,6 +359,7 @@ MIGRATION_SQL = [
     "ALTER TABLE model_predictions ADD COLUMN IF NOT EXISTS relievers_used_3d DOUBLE",
     "ALTER TABLE model_predictions ADD COLUMN IF NOT EXISTS market_home_implied_prob DOUBLE",
     "ALTER TABLE model_predictions ADD COLUMN IF NOT EXISTS offense_vs_starter_hand DOUBLE",
+    "ALTER TABLE game_results ADD COLUMN IF NOT EXISTS event_start_time TIMESTAMP",
     "ALTER TABLE game_results ADD COLUMN IF NOT EXISTS away_team VARCHAR",
     "ALTER TABLE game_results ADD COLUMN IF NOT EXISTS home_team VARCHAR",
     "ALTER TABLE collector_runs ADD COLUMN IF NOT EXISTS bet_opportunities INTEGER",
@@ -540,6 +578,26 @@ SELECT
     AVG(expected_value) AS avg_expected_value
 FROM settled_bet_opportunities_deduped
 GROUP BY game_date, model_name, source;
+
+CREATE OR REPLACE VIEW latest_feature_importances AS
+WITH latest AS (
+    SELECT
+        model_name,
+        MAX(trained_at) AS trained_at
+    FROM feature_importances
+    GROUP BY model_name
+)
+SELECT
+    fi.*
+FROM feature_importances fi
+JOIN latest l
+  ON fi.model_name = l.model_name
+ AND fi.trained_at = l.trained_at;
+
+CREATE OR REPLACE VIEW latest_champion_selection AS
+SELECT *
+FROM champion_history
+WHERE selected_at = (SELECT MAX(selected_at) FROM champion_history);
 
 CREATE OR REPLACE VIEW historical_import_status AS
 SELECT

@@ -1,10 +1,13 @@
 import logging
 import pickle
+import uuid
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
+from mlpm.config.settings import settings
 from mlpm.models.game_outcome import (
     BAYES_MODEL_NAME,
     FEATURE_COLUMNS,
@@ -15,12 +18,15 @@ from mlpm.models.game_outcome import (
     analyze_forward_feature_selection,
     benchmark_game_outcome_models,
     build_training_dataset,
+    compute_permutation_importances,
     load_trained_model,
+    persist_feature_importances,
     predict_home_win_probabilities,
     run_model_benchmark,
     save_trained_model,
     train_game_outcome_model,
 )
+from mlpm.storage.duckdb import connect_read_only, query_dataframe
 
 
 def test_build_training_dataset_creates_pregame_feature_rows() -> None:
@@ -319,3 +325,109 @@ def test_analyze_forward_feature_selection_returns_aic_and_bic_models() -> None:
     assert set(result["best_bic_model"]["features"]).issubset(FEATURE_COLUMNS)
     assert "log_loss" in result["best_aic_model"]["valid_metrics"]
     assert "accuracy" in result["best_bic_model"]["valid_metrics"]
+
+
+def _synthetic_training_frame(rows: int = 16) -> pd.DataFrame:
+    data = []
+    for index in range(rows):
+        home_win = index % 2
+        data.append(
+            {
+                "game_id": str(index),
+                "game_date": pd.Timestamp("2026-04-01") + pd.Timedelta(days=index),
+                "target_home_win": home_win,
+                "season_win_pct_diff": 0.10 if home_win else -0.10,
+                "recent_win_pct_diff": 0.12 if home_win else -0.12,
+                "venue_win_pct_diff": 0.08 if home_win else -0.08,
+                "run_diff_per_game_diff": 0.9 if home_win else -0.9,
+                "season_runs_scored_per_game_diff": 0.6 if home_win else -0.6,
+                "season_runs_allowed_per_game_adv": 0.5 if home_win else -0.5,
+                "recent_runs_scored_per_game_diff": 0.7 if home_win else -0.7,
+                "recent_runs_allowed_per_game_adv": 0.6 if home_win else -0.6,
+                "rest_days_diff": 1.0 if home_win else -1.0,
+                "venue_streak_diff": 2.0 if home_win else -2.0,
+                "travel_switch_adv": 1.0 if home_win else -1.0,
+                "doubleheader_flag": 0.0,
+                "streak_diff": 2.0 if home_win else -2.0,
+                "elo_diff": 25.0 if home_win else -25.0,
+                "elo_home_win_prob": 0.58 if home_win else 0.42,
+                "market_home_implied_prob": 0.57 if home_win else 0.43,
+                "offense_vs_starter_hand_diff": 0.4 if home_win else -0.4,
+                "starter_era_adv": 1.2 if home_win else -1.2,
+                "starter_whip_adv": 0.3 if home_win else -0.3,
+                "starter_strikeouts_per_9_diff": 1.5 if home_win else -1.5,
+                "starter_walks_per_9_adv": 0.8 if home_win else -0.8,
+                "bullpen_innings_3d_adv": 2.0 if home_win else -2.0,
+                "bullpen_pitches_3d_adv": 30.0 if home_win else -30.0,
+                "relievers_used_3d_adv": 2.0 if home_win else -2.0,
+            }
+        )
+    return pd.DataFrame(data)
+
+
+def test_compute_permutation_importances_returns_ranked_long_frame() -> None:
+    training_df = _synthetic_training_frame()
+    bundle = train_game_outcome_model(training_df)
+    pipelines = bundle["candidate_pipelines"]
+    # Re-use the same synthetic frame as the "validation set" to keep the test self-contained.
+    importances = compute_permutation_importances(pipelines, training_df, n_repeats=3, random_state=7)
+
+    assert not importances.empty
+    assert set(importances.columns) >= {"model_name", "feature", "importance", "importance_std", "rank"}
+    # Every model should have one row per feature, ranks 1..N.
+    for model_name, group in importances.groupby("model_name"):
+        assert len(group) == len(FEATURE_COLUMNS)
+        assert sorted(group["rank"].tolist()) == list(range(1, len(FEATURE_COLUMNS) + 1))
+        assert set(group["feature"]) == set(FEATURE_COLUMNS)
+
+
+def test_persist_feature_importances_roundtrips_via_latest_view(monkeypatch) -> None:
+    db_path = Path(".tmp") / f"feat-importance-{uuid.uuid4().hex}.duckdb"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("DUCKDB_PATH", str(db_path))
+    settings.cache_clear()
+
+    frame = pd.DataFrame(
+        [
+            {"model_name": "m1", "feature": "f1", "importance": 0.10, "importance_std": 0.01, "rank": 1},
+            {"model_name": "m1", "feature": "f2", "importance": 0.05, "importance_std": 0.01, "rank": 2},
+            {"model_name": "m2", "feature": "f1", "importance": 0.03, "importance_std": 0.02, "rank": 1},
+        ]
+    )
+    rows_written = persist_feature_importances(
+        frame,
+        trained_at=datetime(2026, 4, 15, 12, 0, 0),
+        train_start_date="2026-01-01",
+        train_end_date="2026-04-14",
+        rows_train=100,
+        rows_valid=25,
+        method="permutation",
+    )
+    assert rows_written == 3
+
+    conn = connect_read_only(settings().duckdb_path)
+    try:
+        latest = query_dataframe(conn, "SELECT * FROM latest_feature_importances ORDER BY model_name, rank")
+    finally:
+        conn.close()
+
+    assert len(latest) == 3
+    assert set(latest["model_name"]) == {"m1", "m2"}
+    assert latest[latest["model_name"] == "m1"].sort_values("rank")["feature"].tolist() == ["f1", "f2"]
+
+
+def test_persist_feature_importances_empty_frame_writes_nothing(monkeypatch) -> None:
+    db_path = Path(".tmp") / f"feat-importance-empty-{uuid.uuid4().hex}.duckdb"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("DUCKDB_PATH", str(db_path))
+    settings.cache_clear()
+
+    rows_written = persist_feature_importances(
+        pd.DataFrame(),
+        trained_at=datetime(2026, 4, 15, 12, 0, 0),
+        train_start_date="2026-01-01",
+        train_end_date="2026-04-14",
+        rows_train=0,
+        rows_valid=0,
+    )
+    assert rows_written == 0

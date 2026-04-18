@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import pickle
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import mlflow
@@ -13,6 +14,7 @@ from joblib import load as joblib_load
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.impute import SimpleImputer
+from sklearn.inspection import permutation_importance
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
@@ -23,8 +25,9 @@ from sklearn.svm import SVC
 from mlpm.config.settings import settings
 from mlpm.features.matchups import OFFENSE_SPLIT_PRIOR, offense_score_from_stats, offense_split_value
 from mlpm.features.team_strength import ELO_BASELINE, ELO_K_FACTOR, RECENT_GAMES_WINDOW
+from mlpm.features.utils import coalesce_float, current_streak, normalize_pitcher_hand, smoothed_win_pct
 from mlpm.ingest.mlb_stats import fetch_final_results, fetch_game_batting_logs, fetch_game_pitching_logs
-from mlpm.storage.duckdb import connect, query_dataframe
+from mlpm.storage.duckdb import append_dataframe, connect, query_dataframe
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +64,31 @@ FEATURE_COLUMNS = [
 ]
 BAYES_EVIDENCE_FEATURE_COLUMNS = [column for column in FEATURE_COLUMNS if column != "market_home_implied_prob"]
 STARTER_LOOKBACK_GAMES = 5
+
+# Heuristic benchmark weights are hand-tuned so the baseline stays interpretable and roughly aligned
+# with the relative scale of the engineered tabular features. They are not learned coefficients.
+HEURISTIC_WEIGHT_SEASON_WIN_PCT = 1.2
+HEURISTIC_WEIGHT_RECENT_WIN_PCT = 0.8
+HEURISTIC_WEIGHT_VENUE_WIN_PCT = 0.6
+HEURISTIC_WEIGHT_RUN_DIFF = 0.2
+HEURISTIC_WEIGHT_SEASON_RUNS_SCORED = 0.10
+HEURISTIC_WEIGHT_SEASON_RUNS_ALLOWED = 0.10
+HEURISTIC_WEIGHT_RECENT_RUNS_SCORED = 0.14
+HEURISTIC_WEIGHT_RECENT_RUNS_ALLOWED = 0.14
+HEURISTIC_WEIGHT_REST_DAYS = 0.05
+HEURISTIC_WEIGHT_VENUE_STREAK = 0.02
+HEURISTIC_WEIGHT_TRAVEL_SWITCH = 0.08
+HEURISTIC_WEIGHT_DOUBLEHEADER = 0.05
+HEURISTIC_WEIGHT_STREAK = 0.03
+HEURISTIC_ELO_DIFF_DIVISOR = 150.0
+HEURISTIC_ELO_PROB_CENTER_WEIGHT = 1.5
+HEURISTIC_WEIGHT_STARTER_ERA = 0.12
+HEURISTIC_WEIGHT_STARTER_WHIP = 0.45
+HEURISTIC_WEIGHT_STARTER_K9 = 0.04
+HEURISTIC_WEIGHT_STARTER_BB9 = 0.07
+HEURISTIC_WEIGHT_BULLPEN_INNINGS = 0.015
+HEURISTIC_BULLPEN_PITCHES_DIVISOR = 5000.0
+HEURISTIC_WEIGHT_RELIEVERS_USED = 0.02
 
 
 @dataclass
@@ -243,6 +271,9 @@ def train_game_outcome_model(training_df: pd.DataFrame) -> dict[str, object]:
     selected_metrics["rows_train"] = int(len(train_df))
     selected_metrics["rows_valid"] = int(len(valid_df))
 
+    # Permutation importance per candidate pipeline on the held-out validation set.
+    feature_importances = compute_permutation_importances(candidate_models, valid_df)
+
     mlflow.set_tracking_uri(settings().mlflow_tracking_uri)
     with mlflow.start_run(run_name=selected_model_name):
         mlflow.log_params(
@@ -255,6 +286,14 @@ def train_game_outcome_model(training_df: pd.DataFrame) -> dict[str, object]:
         for model_name, metrics in candidate_metrics.items():
             prefix = model_name.replace("-", "_")
             mlflow.log_metrics({f"{prefix}_{key}": value for key, value in metrics.items()})
+        if not feature_importances.empty:
+            for importance_row in feature_importances.to_dict(orient="records"):
+                prefix = str(importance_row["model_name"]).replace("-", "_")
+                metric_name = f"feat_importance__{prefix}__{importance_row['feature']}"
+                try:
+                    mlflow.log_metric(metric_name, float(importance_row["importance"]))
+                except Exception:  # pragma: no cover - defensive
+                    pass
         try:
             mlflow.sklearn.log_model(selected_pipeline, "model")
         except PermissionError:
@@ -268,12 +307,16 @@ def train_game_outcome_model(training_df: pd.DataFrame) -> dict[str, object]:
         "metrics": selected_metrics,
         "candidate_metrics": candidate_metrics,
         "benchmarks": benchmarks,
+        "feature_importances": feature_importances.to_dict(orient="records"),
         "pipeline": selected_pipeline,
+        "candidate_pipelines": candidate_models,
         "bayes_model_name": BAYES_MODEL_NAME,
         "bayes_base_rate": bayes_bundle["base_rate"],
         "bayes_evidence_pipeline": bayes_bundle["pipeline"],
         "bayes_evidence_feature_columns": BAYES_EVIDENCE_FEATURE_COLUMNS,
         "bayes_prior_default": 0.5,
+        "rows_train": int(len(train_df)),
+        "rows_valid": int(len(valid_df)),
     }
 
 
@@ -282,7 +325,29 @@ def train_and_save_model(start_date: str, end_date: str, path: Path | None = Non
     training_df = build_training_dataset(results_df, pitching_logs_df, batting_logs_df=batting_logs_df, market_priors_df=market_priors_df)
     bundle = train_game_outcome_model(training_df)
     saved_path = save_trained_model(bundle, path=path)
-    return {"bundle": bundle, "path": saved_path, "rows": len(training_df)}
+
+    importances = pd.DataFrame(bundle.get("feature_importances") or [])
+    rows_written = 0
+    if not importances.empty:
+        try:
+            rows_written = persist_feature_importances(
+                importances,
+                trained_at=datetime.now(),
+                train_start_date=str(bundle.get("trained_on_start_date") or start_date),
+                train_end_date=str(bundle.get("trained_on_end_date") or end_date),
+                rows_train=int(bundle.get("rows_train") or 0),
+                rows_valid=int(bundle.get("rows_valid") or 0),
+                method="permutation",
+            )
+        except Exception:  # pragma: no cover - don't fail the training if DuckDB write fails
+            logger.warning("Failed to persist feature importances", exc_info=True)
+
+    return {
+        "bundle": bundle,
+        "path": saved_path,
+        "rows": len(training_df),
+        "feature_importance_rows": rows_written,
+    }
 
 
 def run_model_benchmark(start_date: str, end_date: str) -> dict[str, object]:
@@ -518,28 +583,28 @@ def benchmark_game_outcome_models(
     )
     home_win_rate = float(train_df["target_home_win"].mean())
     heuristic_score = (
-        (valid_df["season_win_pct_diff"] * 1.2)
-        + (valid_df["recent_win_pct_diff"] * 0.8)
-        + (valid_df["venue_win_pct_diff"] * 0.6)
-        + (valid_df["run_diff_per_game_diff"] * 0.2)
-        + (valid_df["season_runs_scored_per_game_diff"] * 0.10)
-        + (valid_df["season_runs_allowed_per_game_adv"] * 0.10)
-        + (valid_df["recent_runs_scored_per_game_diff"] * 0.14)
-        + (valid_df["recent_runs_allowed_per_game_adv"] * 0.14)
-        + (valid_df["rest_days_diff"] * 0.05)
-        + (valid_df["venue_streak_diff"] * 0.02)
-        + (valid_df["travel_switch_adv"] * 0.08)
-        - (valid_df["doubleheader_flag"] * 0.05)
-        + (valid_df["streak_diff"] * 0.03)
-        + (valid_df["elo_diff"] / 150.0)
-        + ((valid_df["elo_home_win_prob"] - 0.5) * 1.5)
-        + (valid_df["starter_era_adv"] * 0.12)
-        + (valid_df["starter_whip_adv"] * 0.45)
-        + (valid_df["starter_strikeouts_per_9_diff"] * 0.04)
-        + (valid_df["starter_walks_per_9_adv"] * 0.07)
-        + (valid_df["bullpen_innings_3d_adv"] * 0.015)
-        + (valid_df["bullpen_pitches_3d_adv"] / 5000.0)
-        + (valid_df["relievers_used_3d_adv"] * 0.02)
+        (valid_df["season_win_pct_diff"] * HEURISTIC_WEIGHT_SEASON_WIN_PCT)
+        + (valid_df["recent_win_pct_diff"] * HEURISTIC_WEIGHT_RECENT_WIN_PCT)
+        + (valid_df["venue_win_pct_diff"] * HEURISTIC_WEIGHT_VENUE_WIN_PCT)
+        + (valid_df["run_diff_per_game_diff"] * HEURISTIC_WEIGHT_RUN_DIFF)
+        + (valid_df["season_runs_scored_per_game_diff"] * HEURISTIC_WEIGHT_SEASON_RUNS_SCORED)
+        + (valid_df["season_runs_allowed_per_game_adv"] * HEURISTIC_WEIGHT_SEASON_RUNS_ALLOWED)
+        + (valid_df["recent_runs_scored_per_game_diff"] * HEURISTIC_WEIGHT_RECENT_RUNS_SCORED)
+        + (valid_df["recent_runs_allowed_per_game_adv"] * HEURISTIC_WEIGHT_RECENT_RUNS_ALLOWED)
+        + (valid_df["rest_days_diff"] * HEURISTIC_WEIGHT_REST_DAYS)
+        + (valid_df["venue_streak_diff"] * HEURISTIC_WEIGHT_VENUE_STREAK)
+        + (valid_df["travel_switch_adv"] * HEURISTIC_WEIGHT_TRAVEL_SWITCH)
+        - (valid_df["doubleheader_flag"] * HEURISTIC_WEIGHT_DOUBLEHEADER)
+        + (valid_df["streak_diff"] * HEURISTIC_WEIGHT_STREAK)
+        + (valid_df["elo_diff"] / HEURISTIC_ELO_DIFF_DIVISOR)
+        + ((valid_df["elo_home_win_prob"] - 0.5) * HEURISTIC_ELO_PROB_CENTER_WEIGHT)
+        + (valid_df["starter_era_adv"] * HEURISTIC_WEIGHT_STARTER_ERA)
+        + (valid_df["starter_whip_adv"] * HEURISTIC_WEIGHT_STARTER_WHIP)
+        + (valid_df["starter_strikeouts_per_9_diff"] * HEURISTIC_WEIGHT_STARTER_K9)
+        + (valid_df["starter_walks_per_9_adv"] * HEURISTIC_WEIGHT_STARTER_BB9)
+        + (valid_df["bullpen_innings_3d_adv"] * HEURISTIC_WEIGHT_BULLPEN_INNINGS)
+        + (valid_df["bullpen_pitches_3d_adv"] / HEURISTIC_BULLPEN_PITCHES_DIVISOR)
+        + (valid_df["relievers_used_3d_adv"] * HEURISTIC_WEIGHT_RELIEVERS_USED)
     )
     benchmark_probabilities.update(
         {
@@ -558,6 +623,105 @@ def benchmark_game_outcome_models(
         ignore_index=True,
     )
     return {"benchmarks": benchmark_metrics, "calibration": calibration.to_dict(orient="records")}
+
+
+def compute_permutation_importances(
+    candidates: dict[str, Pipeline],
+    valid_df: pd.DataFrame,
+    *,
+    n_repeats: int = 10,
+    random_state: int = 42,
+    scoring: str = "neg_log_loss",
+) -> pd.DataFrame:
+    """
+    Compute sklearn permutation importance on the validation set for each candidate pipeline.
+
+    Returns a long-format DataFrame with columns:
+      model_name, feature, importance, importance_std, rank.
+    Higher `importance` means permuting that feature degrades `scoring` more,
+    i.e. the feature mattered more.
+    """
+    _require_feature_columns(valid_df)
+    X_valid = valid_df[FEATURE_COLUMNS]
+    y_valid = valid_df["target_home_win"].astype(int)
+
+    rows: list[dict[str, object]] = []
+    for model_name, pipeline in candidates.items():
+        try:
+            result = permutation_importance(
+                pipeline,
+                X_valid,
+                y_valid,
+                n_repeats=n_repeats,
+                random_state=random_state,
+                scoring=scoring,
+                n_jobs=1,
+            )
+        except Exception:  # pragma: no cover - defensive; some estimators may not score cleanly
+            logger.warning("Permutation importance failed for %s; skipping", model_name, exc_info=True)
+            continue
+
+        importances = np.asarray(result.importances_mean, dtype=float)
+        stds = np.asarray(result.importances_std, dtype=float)
+        # Rank by descending importance.
+        order = np.argsort(-importances, kind="mergesort")
+        for rank_position, column_index in enumerate(order, start=1):
+            rows.append(
+                {
+                    "model_name": model_name,
+                    "feature": FEATURE_COLUMNS[int(column_index)],
+                    "importance": float(importances[int(column_index)]),
+                    "importance_std": float(stds[int(column_index)]),
+                    "rank": rank_position,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def persist_feature_importances(
+    importances: pd.DataFrame,
+    *,
+    trained_at: datetime,
+    train_start_date: str,
+    train_end_date: str,
+    rows_train: int,
+    rows_valid: int,
+    method: str = "permutation",
+    duckdb_path: Path | None = None,
+) -> int:
+    """Append feature importance rows to DuckDB. Returns the number of rows written."""
+    if importances.empty:
+        return 0
+    frame = importances.copy()
+    frame.insert(0, "trained_at", trained_at)
+    frame.insert(1, "train_start_date", train_start_date)
+    frame.insert(2, "train_end_date", train_end_date)
+    frame.insert(3, "rows_train", int(rows_train))
+    frame.insert(4, "rows_valid", int(rows_valid))
+    frame.insert(5, "method", method)
+    # Ensure column order matches the table definition.
+    frame = frame[
+        [
+            "trained_at",
+            "model_name",
+            "train_start_date",
+            "train_end_date",
+            "rows_train",
+            "rows_valid",
+            "method",
+            "feature",
+            "importance",
+            "importance_std",
+            "rank",
+        ]
+    ]
+    path = duckdb_path or settings().duckdb_path
+    conn = connect(path)
+    try:
+        append_dataframe(conn, "feature_importances", frame)
+    finally:
+        conn.close()
+    return int(len(frame))
 
 
 def build_live_feature_frame(
@@ -701,14 +865,28 @@ def predict_home_win_probabilities(bundle: dict[str, object], features_df: pd.Da
     if features_df.empty:
         return pd.DataFrame()
     _require_feature_columns(features_df)
-    result = features_df.copy()
-    if bundle.get("bayes_evidence_pipeline") is not None and bundle.get("bayes_base_rate") is not None:
-        result["home_win_prob"] = _bayesian_posterior_probabilities(bundle, result)
-        result["model_name"] = str(bundle.get("bayes_model_name", BAYES_MODEL_NAME))
+    results: list[pd.DataFrame] = []
+
+    candidate_pipelines: dict[str, object] = bundle.get("candidate_pipelines") or {}
+    if candidate_pipelines:
+        for model_name, pipeline in candidate_pipelines.items():
+            scored = features_df.copy()
+            scored["home_win_prob"] = pipeline.predict_proba(scored[FEATURE_COLUMNS])[:, 1]
+            scored["model_name"] = model_name
+            results.append(scored)
     else:
-        result["home_win_prob"] = bundle["pipeline"].predict_proba(result[FEATURE_COLUMNS])[:, 1]
-        result["model_name"] = bundle["model_name"]
-    return result
+        scored = features_df.copy()
+        scored["home_win_prob"] = bundle["pipeline"].predict_proba(scored[FEATURE_COLUMNS])[:, 1]
+        scored["model_name"] = bundle["model_name"]
+        results.append(scored)
+
+    if bundle.get("bayes_evidence_pipeline") is not None and bundle.get("bayes_base_rate") is not None:
+        scored = features_df.copy()
+        scored["home_win_prob"] = _bayesian_posterior_probabilities(bundle, scored)
+        scored["model_name"] = str(bundle.get("bayes_model_name", BAYES_MODEL_NAME))
+        results.append(scored)
+
+    return pd.concat(results, ignore_index=True)
 
 
 def _fit_candidate_models(train_df: pd.DataFrame) -> dict[str, Pipeline]:
@@ -1091,7 +1269,7 @@ def _build_game_features(
         "offense_vs_starter_hand_diff": home_offense_vs_opp_hand - away_offense_vs_opp_hand,
         "starter_era_adv": _diff_positive_for_home(away_pitching.get("era"), home_pitching.get("era")),
         "starter_whip_adv": _diff_positive_for_home(away_pitching.get("whip"), home_pitching.get("whip")),
-        "starter_strikeouts_per_9_diff": _coalesce_float(home_pitching.get("strikeouts_per_9")) - _coalesce_float(away_pitching.get("strikeouts_per_9")),
+        "starter_strikeouts_per_9_diff": _float_or_zero(home_pitching.get("strikeouts_per_9")) - _float_or_zero(away_pitching.get("strikeouts_per_9")),
         "starter_walks_per_9_adv": _diff_positive_for_home(away_pitching.get("walks_per_9"), home_pitching.get("walks_per_9")),
         "bullpen_innings_3d_adv": _diff_positive_for_home(away_pitching.get("bullpen_innings_3d"), home_pitching.get("bullpen_innings_3d")),
         "bullpen_pitches_3d_adv": _diff_positive_for_home(away_pitching.get("bullpen_pitches_3d"), home_pitching.get("bullpen_pitches_3d")),
@@ -1111,15 +1289,15 @@ def _snapshot_team(history: list[dict[str, object]], venue_home: bool, elo_ratin
     run_diff_per_game = (run_diff_total / games_played) if games_played else 0.0
     return TeamSnapshot(
         games_played=games_played,
-        season_win_pct=_smoothed_win_pct(wins, games_played),
-        recent_win_pct=_smoothed_win_pct(recent_wins, len(recent)),
-        venue_win_pct=_smoothed_win_pct(venue_wins, len(venue_games)),
+        season_win_pct=smoothed_win_pct(wins, games_played),
+        recent_win_pct=smoothed_win_pct(recent_wins, len(recent)),
+        venue_win_pct=smoothed_win_pct(venue_wins, len(venue_games)),
         run_diff_per_game=run_diff_per_game,
         season_runs_scored_per_game=(sum(int(game["runs_for"]) for game in history) / games_played) if games_played else 0.0,
         season_runs_allowed_per_game=(sum(int(game["runs_against"]) for game in history) / games_played) if games_played else 0.0,
         recent_runs_scored_per_game=(sum(int(game["runs_for"]) for game in recent) / len(recent)) if recent else 0.0,
         recent_runs_allowed_per_game=(sum(int(game["runs_against"]) for game in recent) / len(recent)) if recent else 0.0,
-        streak=_current_streak([bool(game["won"]) for game in history]),
+        streak=current_streak([bool(game["won"]) for game in history]),
         elo_rating=elo_rating,
         last_game_date=pd.to_datetime(history[-1]["game_date"]) if history else None,
         last_is_home=bool(history[-1]["is_home"]) if history else None,
@@ -1169,13 +1347,14 @@ def _pregame_pitching_context(
     return context
 
 
-def _live_pitching_context(game: dict[str, object], side: str) -> dict[str, float | None]:
+def _live_pitching_context(game: dict[str, object], side: str) -> dict[str, object]:
+    raw_hand = game.get(f"{side}_pitcher_pitcher_hand") or game.get(f"{side}_probable_pitcher_hand")
     return {
         "era": _optional_float(game.get(f"{side}_pitcher_era")),
         "whip": _optional_float(game.get(f"{side}_pitcher_whip")),
         "strikeouts_per_9": _optional_float(game.get(f"{side}_pitcher_strikeouts_per_9")),
         "walks_per_9": _optional_float(game.get(f"{side}_pitcher_walks_per_9")),
-        "pitcher_hand": game.get(f"{side}_pitcher_pitcher_hand") or game.get(f"{side}_probable_pitcher_hand"),
+        "pitcher_hand": normalize_pitcher_hand(raw_hand),
         "bullpen_innings_3d": _optional_float(game.get(f"{side}_bullpen_innings_3d")) or 0.0,
         "bullpen_pitches_3d": _optional_float(game.get(f"{side}_bullpen_pitches_3d")) or 0.0,
         "relievers_used_3d": _optional_float(game.get(f"{side}_relievers_used_3d")) or 0.0,
@@ -1223,19 +1402,19 @@ def _update_histories(
         if starter_id is not None and not pd.isna(starter_id):
             pitcher_history.setdefault(int(starter_id), []).append(
                 {
-                    "innings_pitched": _coalesce_float(pitching.get("starter_innings_pitched")),
-                    "earned_runs": _coalesce_float(pitching.get("starter_earned_runs")),
-                    "hits": _coalesce_float(pitching.get("starter_hits")),
-                    "walks": _coalesce_float(pitching.get("starter_walks")),
-                    "strikeouts": _coalesce_float(pitching.get("starter_strikeouts")),
+                    "innings_pitched": _float_or_zero(pitching.get("starter_innings_pitched")),
+                    "earned_runs": _float_or_zero(pitching.get("starter_earned_runs")),
+                    "hits": _float_or_zero(pitching.get("starter_hits")),
+                    "walks": _float_or_zero(pitching.get("starter_walks")),
+                    "strikeouts": _float_or_zero(pitching.get("starter_strikeouts")),
                 }
             )
         team_pitching_history.setdefault(team, []).append(
             {
                 "game_date": game["game_date"],
-                "bullpen_innings": _coalesce_float(pitching.get("bullpen_innings")),
-                "bullpen_pitches": _coalesce_float(pitching.get("bullpen_pitches")),
-                "relievers_used": _coalesce_float(pitching.get("relievers_used")),
+                "bullpen_innings": _float_or_zero(pitching.get("bullpen_innings")),
+                "bullpen_pitches": _float_or_zero(pitching.get("bullpen_pitches")),
+                "relievers_used": _float_or_zero(pitching.get("relievers_used")),
             }
         )
     home_pitching = pitching_lookup.get((game["game_id"], game["home_team"]), {})
@@ -1309,42 +1488,22 @@ def _team_games_on_date(history: list[dict[str, object]], game_date: pd.Timestam
     return sum(1 for game in history if pd.Timestamp(game["game_date"]).normalize() == normalized)
 
 
-def _smoothed_win_pct(wins: int, games: int) -> float:
-    return (wins + 1) / (games + 2)
-
-
-def _current_streak(results: list[bool]) -> int:
-    if not results:
-        return 0
-    latest = results[-1]
-    streak = 0
-    for result in reversed(results):
-        if result != latest:
-            break
-        streak += 1
-    return streak if latest else -streak
-
-
-def _coalesce_float(value: object) -> float:
-    if value is None or pd.isna(value):
-        return 0.0
-    return float(value)
-
-
 def _optional_float(value: object) -> float | None:
-    if value is None or pd.isna(value):
-        return None
-    return float(value)
+    return coalesce_float(value)
+
+
+def _float_or_zero(value: object) -> float:
+    return coalesce_float(value) or 0.0
 
 
 def _diff_positive_for_home(away_value: object, home_value: object) -> float:
-    return _coalesce_float(away_value) - _coalesce_float(home_value)
+    return _float_or_zero(away_value) - _float_or_zero(home_value)
 
 
 def _offense_vs_hand_before_game(history: list[dict[str, object]], pitcher_hand: object) -> float:
     if not history:
         return OFFENSE_SPLIT_PRIOR
-    hand = "L" if str(pitcher_hand).strip().upper().startswith("L") else "R"
+    hand = normalize_pitcher_hand(pitcher_hand)
     matching = [
         float(item["offense_score"])
         for item in history
@@ -1357,8 +1516,12 @@ def _offense_vs_hand_before_game(history: list[dict[str, object]], pitcher_hand:
 
 def _market_home_implied_prob(value: object) -> float:
     if value is None or pd.isna(value):
+        logger.debug("market_home_implied_prob is None/NaN; defaulting to 0.5")
         return 0.5
-    return float(min(max(value, 1e-6), 1 - 1e-6))
+    clipped = float(min(max(value, 1e-6), 1 - 1e-6))
+    if clipped != float(value):
+        logger.debug("market_home_implied_prob clipped from %s to %s", value, clipped)
+    return clipped
 
 
 def _load_historical_market_priors(start_date: str, end_date: str) -> pd.DataFrame:

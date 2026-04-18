@@ -4,6 +4,8 @@ from math import log
 
 import pandas as pd
 
+from mlpm.features.utils import current_streak, smoothed_win_pct
+
 RECENT_GAMES_WINDOW = 10
 ELO_BASELINE = 1500.0
 ELO_K_FACTOR = 20.0
@@ -14,24 +16,8 @@ def _safe_logit(probability: float) -> float:
     return log(probability / (1 - probability))
 
 
-def _smoothed_win_pct(wins: int, games: int) -> float:
-    return (wins + 1) / (games + 2)
-
-
 def _bounded_run_diff(run_diff_per_game: float) -> float:
     return max(min(run_diff_per_game, 3.0), -3.0) / 3.0
-
-
-def _current_streak(results: list[bool]) -> int:
-    if not results:
-        return 0
-    latest = results[-1]
-    streak = 0
-    for result in reversed(results):
-        if result != latest:
-            break
-        streak += 1
-    return streak if latest else -streak
 
 
 def build_team_feature_table(results_df: pd.DataFrame) -> pd.DataFrame:
@@ -104,7 +90,7 @@ def build_team_feature_table(results_df: pd.DataFrame) -> pd.DataFrame:
         recent_wins = int(recent["won"].sum())
         recent_runs_for = int(recent["runs_for"].sum())
         recent_runs_against = int(recent["runs_against"].sum())
-        streak = _current_streak(group["won"].tolist())
+        streak = current_streak(group["won"].tolist())
         last_game_date = group["game_date"].iloc[-1]
         last_is_home = bool(group["is_home"].iloc[-1])
         venue_streak = 0
@@ -113,10 +99,10 @@ def build_team_feature_table(results_df: pd.DataFrame) -> pd.DataFrame:
                 break
             venue_streak += 1
 
-        season_win_pct = _smoothed_win_pct(wins, games_played)
-        recent_win_pct = _smoothed_win_pct(recent_wins, recent_games)
-        home_win_pct = _smoothed_win_pct(home_wins, home_games)
-        away_win_pct = _smoothed_win_pct(away_wins, away_games)
+        season_win_pct = smoothed_win_pct(wins, games_played)
+        recent_win_pct = smoothed_win_pct(recent_wins, recent_games)
+        home_win_pct = smoothed_win_pct(home_wins, home_games)
+        away_win_pct = smoothed_win_pct(away_wins, away_games)
 
         rows.append(
             {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import date
 from math import exp
 
@@ -22,6 +23,36 @@ from mlpm.models.game_outcome import (
     load_trained_model,
     predict_home_win_probabilities,
 )
+from mlpm.features.utils import coalesce_float
+
+logger = logging.getLogger(__name__)
+
+# Heuristic live model weights are hand-tuned to keep recent form, venue split, and run differential
+# in the same rough range as the underlying logit-transformed team-strength features.
+RECENT_STRENGTH_WEIGHT = 0.60
+VENUE_STRENGTH_WEIGHT = 0.35
+RUN_DIFF_STRENGTH_WEIGHT = 0.30
+STREAK_WEIGHT = 0.04
+
+# Pitcher adjustments are scaled to treat WHIP as the strongest single live pitching signal, with
+# ERA, strikeout rate, walk rate, and recent workload acting as smaller corrections.
+PITCHER_ERA_BASELINE = 4.25
+PITCHER_ERA_WEIGHT = 0.10
+PITCHER_WHIP_BASELINE = 1.30
+PITCHER_WHIP_WEIGHT = 0.60
+PITCHER_K9_BASELINE = 8.0
+PITCHER_K9_WEIGHT = 0.03
+PITCHER_BB9_BASELINE = 3.0
+PITCHER_BB9_WEIGHT = 0.05
+PITCHER_INNINGS_BASELINE = 20.0
+PITCHER_INNINGS_DIVISOR = 100.0
+PITCHER_INNINGS_CAP = 0.15
+
+# Bullpen fatigue is intentionally a smaller adjustment than the starter signal and is meant to
+# penalize recent usage without dominating the rating.
+BULLPEN_INNINGS_WEIGHT = 0.015
+BULLPEN_PITCHES_DIVISOR = 5000.0
+BULLPEN_RELIEVERS_WEIGHT = 0.02
 
 
 def _sigmoid(value: float) -> float:
@@ -30,29 +61,39 @@ def _sigmoid(value: float) -> float:
 
 def build_team_strengths(games_df: pd.DataFrame) -> pd.DataFrame:
     if games_df.empty:
+        logger.warning("Team strengths unavailable; games frame is empty.")
         return pd.DataFrame()
 
     season = pd.to_datetime(games_df["game_date"]).dt.year.mode().iloc[0]
     results = fetch_final_results(f"{season}-03-01", date.today().isoformat())
     if results.empty:
+        logger.warning("Team strengths unavailable; no final results returned for season=%s", season)
         return pd.DataFrame()
     return build_team_feature_table(results)
 
 
 def build_team_matchups(games_df: pd.DataFrame) -> pd.DataFrame:
     if games_df.empty:
+        logger.warning("Team matchups unavailable; games frame is empty.")
         return pd.DataFrame()
 
     season = pd.to_datetime(games_df["game_date"]).dt.year.mode().iloc[0]
     batting_logs = fetch_game_batting_logs(f"{season}-03-01", date.today().isoformat())
     pitching_logs = fetch_game_pitching_logs(f"{season}-03-01", date.today().isoformat())
     if batting_logs.empty or pitching_logs.empty:
+        logger.warning(
+            "Team matchups unavailable; batting_rows=%s pitching_rows=%s season=%s",
+            len(batting_logs),
+            len(pitching_logs),
+            season,
+        )
         return pd.DataFrame()
     return build_team_offense_split_table(batting_logs, pitching_logs)
 
 
 def build_model_probabilities(games_df: pd.DataFrame, market_priors_df: pd.DataFrame | None = None) -> pd.DataFrame:
     if games_df.empty:
+        logger.warning("Model probabilities unavailable; games frame is empty.")
         return pd.DataFrame()
 
     strengths = build_team_strengths(games_df)
@@ -101,6 +142,10 @@ def _build_trained_model_probabilities(
         market_priors_df=market_priors_df,
     )
     if features.empty:
+        logger.warning(
+            "Trained model probabilities unavailable; live feature frame is empty for games_rows=%s",
+            len(games_with_pitching_df),
+        )
         return pd.DataFrame()
 
     scored = predict_home_win_probabilities(trained_model, features)
@@ -185,19 +230,19 @@ def _build_heuristic_model_probabilities(
 
         home_rating = (
             home["season_strength"]
-            + 0.60 * home["recent_strength"]
-            + 0.35 * home["home_strength"]
-            + 0.30 * home["run_diff_strength"]
-            + 0.04 * home["streak"]
+            + (RECENT_STRENGTH_WEIGHT * home["recent_strength"])
+            + (VENUE_STRENGTH_WEIGHT * home["home_strength"])
+            + (RUN_DIFF_STRENGTH_WEIGHT * home["run_diff_strength"])
+            + (STREAK_WEIGHT * home["streak"])
             + home_pitcher_edge
             - home_bullpen_penalty
         )
         away_rating = (
             away["season_strength"]
-            + 0.60 * away["recent_strength"]
-            + 0.35 * away["away_strength"]
-            + 0.30 * away["run_diff_strength"]
-            + 0.04 * away["streak"]
+            + (RECENT_STRENGTH_WEIGHT * away["recent_strength"])
+            + (VENUE_STRENGTH_WEIGHT * away["away_strength"])
+            + (RUN_DIFF_STRENGTH_WEIGHT * away["run_diff_strength"])
+            + (STREAK_WEIGHT * away["streak"])
             + away_pitcher_edge
             - away_bullpen_penalty
         )
@@ -252,34 +297,35 @@ def _build_heuristic_model_probabilities(
 
 
 def _pitcher_rating(game: dict[str, object], side: str) -> float:
-    era = _coalesce_float(game.get(f"{side}_pitcher_era"))
-    whip = _coalesce_float(game.get(f"{side}_pitcher_whip"))
-    strikeouts_per_9 = _coalesce_float(game.get(f"{side}_pitcher_strikeouts_per_9"))
-    walks_per_9 = _coalesce_float(game.get(f"{side}_pitcher_walks_per_9"))
-    innings_pitched = _coalesce_float(game.get(f"{side}_pitcher_innings_pitched"))
+    era = coalesce_float(game.get(f"{side}_pitcher_era"))
+    whip = coalesce_float(game.get(f"{side}_pitcher_whip"))
+    strikeouts_per_9 = coalesce_float(game.get(f"{side}_pitcher_strikeouts_per_9"))
+    walks_per_9 = coalesce_float(game.get(f"{side}_pitcher_walks_per_9"))
+    innings_pitched = coalesce_float(game.get(f"{side}_pitcher_innings_pitched"))
 
     rating = 0.0
     if era is not None:
-        rating += (4.25 - era) * 0.10
+        rating += (PITCHER_ERA_BASELINE - era) * PITCHER_ERA_WEIGHT
     if whip is not None:
-        rating += (1.30 - whip) * 0.60
+        rating += (PITCHER_WHIP_BASELINE - whip) * PITCHER_WHIP_WEIGHT
     if strikeouts_per_9 is not None:
-        rating += (strikeouts_per_9 - 8.0) * 0.03
+        rating += (strikeouts_per_9 - PITCHER_K9_BASELINE) * PITCHER_K9_WEIGHT
     if walks_per_9 is not None:
-        rating += (3.0 - walks_per_9) * 0.05
+        rating += (PITCHER_BB9_BASELINE - walks_per_9) * PITCHER_BB9_WEIGHT
     if innings_pitched is not None:
-        rating += min(max((innings_pitched - 20.0) / 100.0, -0.15), 0.15)
+        rating += min(
+            max((innings_pitched - PITCHER_INNINGS_BASELINE) / PITCHER_INNINGS_DIVISOR, -PITCHER_INNINGS_CAP),
+            PITCHER_INNINGS_CAP,
+        )
     return rating
 
 
 def _bullpen_penalty(game: dict[str, object], side: str) -> float:
-    innings_3d = _coalesce_float(game.get(f"{side}_bullpen_innings_3d")) or 0.0
-    pitches_3d = _coalesce_float(game.get(f"{side}_bullpen_pitches_3d")) or 0.0
-    relievers_1d = _coalesce_float(game.get(f"{side}_relievers_used_1d")) or 0.0
-    return (innings_3d * 0.015) + (pitches_3d / 5000.0) + (relievers_1d * 0.02)
-
-
-def _coalesce_float(value: object) -> float | None:
-    if value is None or pd.isna(value):
-        return None
-    return float(value)
+    innings_3d = coalesce_float(game.get(f"{side}_bullpen_innings_3d")) or 0.0
+    pitches_3d = coalesce_float(game.get(f"{side}_bullpen_pitches_3d")) or 0.0
+    relievers_1d = coalesce_float(game.get(f"{side}_relievers_used_1d")) or 0.0
+    return (
+        (innings_3d * BULLPEN_INNINGS_WEIGHT)
+        + (pitches_3d / BULLPEN_PITCHES_DIVISOR)
+        + (relievers_1d * BULLPEN_RELIEVERS_WEIGHT)
+    )

@@ -36,6 +36,11 @@ def _configure_logging() -> None:
     )
 
 
+def _validate_date_range(start_date: str, end_date: str, *, label: str) -> None:
+    if date.fromisoformat(start_date) > date.fromisoformat(end_date):
+        raise SystemExit(f"{label} start_date must be on or before end_date.")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mlpm")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -474,6 +479,21 @@ def app() -> None:
     parser = _build_parser()
     args = parser.parse_args()
 
+    if args.command in {
+        "report-settled-predictions",
+        "report-settled-windows",
+        "report-bet-opportunities",
+        "report-strategy-performance",
+        "historical-backfill-polymarket",
+        "historical-backfill-kalshi",
+        "historical-import-status",
+        "backtest",
+        "train-game-model",
+        "benchmark-game-model",
+        "forward-select-game-features",
+    }:
+        _validate_date_range(args.start_date, args.end_date, label=args.command)
+
     if args.command == "collect-once":
         print(collect_snapshot())
         return
@@ -556,10 +576,12 @@ def app() -> None:
         eval_end_date = args.eval_end_date or args.end_date
         if not eval_start_date or not eval_end_date:
             raise SystemExit("historical-backtest-kalshi requires either --eval-start-date/--eval-end-date or --start-date/--end-date.")
+        _validate_date_range(eval_start_date, eval_end_date, label="historical-backtest-kalshi eval")
         train_start_date = args.train_start_date or settings().model_train_start_date
         train_end_date = args.train_end_date
         if train_end_date is None:
             train_end_date = (date.fromisoformat(eval_start_date) - timedelta(days=1)).isoformat()
+        _validate_date_range(train_start_date, train_end_date, label="historical-backtest-kalshi train")
         print(
             _format_historical_backtest_output(
                 run_historical_kalshi_backtest(

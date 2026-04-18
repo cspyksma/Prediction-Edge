@@ -142,6 +142,102 @@ def run_settled_window_report(
     }
 
 
+def compute_settled_calibration(
+    model_name: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    bins: int = 10,
+) -> pd.DataFrame:
+    """
+    Bucket settled predictions by predicted home-win probability and compare the
+    bucket's average predicted probability against the empirical home-win rate.
+
+    Returns a DataFrame with columns:
+      model_name, bucket, bucket_lower, bucket_upper,
+      games, avg_predicted_prob, actual_home_win_rate, abs_error
+    """
+    if bins < 2:
+        raise ValueError("bins must be >= 2")
+
+    filters: list[str] = []
+    params: list[object] = []
+    if model_name:
+        filters.append("model_name = ?")
+        params.append(model_name)
+    if start_date:
+        filters.append("game_date >= ?")
+        params.append(start_date)
+    if end_date:
+        filters.append("game_date <= ?")
+        params.append(end_date)
+    where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+
+    conn = connect_read_only(settings().duckdb_path)
+    try:
+        frame = query_dataframe(
+            conn,
+            f"""
+            SELECT model_name, home_win_prob, actual_home_win
+            FROM settled_predictions_deduped
+            {where_clause}
+            """,
+            params=params if params else None,
+        )
+    finally:
+        conn.close()
+
+    if frame.empty:
+        return pd.DataFrame(
+            columns=[
+                "model_name",
+                "bucket",
+                "bucket_lower",
+                "bucket_upper",
+                "games",
+                "avg_predicted_prob",
+                "actual_home_win_rate",
+                "abs_error",
+            ]
+        )
+
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    frame = frame.copy()
+    frame["home_win_prob"] = np.clip(frame["home_win_prob"].astype(float), 0.0, 1.0)
+    frame["bucket_index"] = pd.cut(
+        frame["home_win_prob"], bins=edges, include_lowest=True, labels=False
+    ).astype("Int64")
+    frame["bucket_lower"] = frame["bucket_index"].astype(float).map(lambda i: edges[int(i)] if pd.notna(i) else np.nan)
+    frame["bucket_upper"] = frame["bucket_index"].astype(float).map(lambda i: edges[int(i) + 1] if pd.notna(i) else np.nan)
+
+    grouped = (
+        frame.groupby(["model_name", "bucket_index"], observed=True)
+        .agg(
+            games=("home_win_prob", "size"),
+            avg_predicted_prob=("home_win_prob", "mean"),
+            actual_home_win_rate=("actual_home_win", "mean"),
+            bucket_lower=("bucket_lower", "first"),
+            bucket_upper=("bucket_upper", "first"),
+        )
+        .reset_index()
+    )
+    grouped["abs_error"] = (grouped["avg_predicted_prob"] - grouped["actual_home_win_rate"]).abs()
+    grouped["bucket"] = grouped.apply(
+        lambda row: f"[{row['bucket_lower']:.2f}, {row['bucket_upper']:.2f}]", axis=1
+    )
+    return grouped[
+        [
+            "model_name",
+            "bucket",
+            "bucket_lower",
+            "bucket_upper",
+            "games",
+            "avg_predicted_prob",
+            "actual_home_win_rate",
+            "abs_error",
+        ]
+    ].sort_values(["model_name", "bucket_lower"], kind="mergesort").reset_index(drop=True)
+
+
 def _game_level_metrics(frame: pd.DataFrame) -> dict[str, Any]:
     probabilities = np.clip(frame["home_win_prob"].to_numpy(dtype=float), 1e-6, 1 - 1e-6)
     actual = frame["actual_home_win"].to_numpy(dtype=float)

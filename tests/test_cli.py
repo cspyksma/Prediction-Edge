@@ -4,6 +4,7 @@ import pytest
 
 from mlpm.cli import (
     _build_parser,
+    app,
     _format_bet_opportunity_output,
     _format_benchmark_game_model_output,
     _format_historical_import_output,
@@ -264,3 +265,30 @@ def test_cli_parser_normalizes_valid_iso_dates() -> None:
 
     assert args.start_date == "2026-04-01"
     assert args.end_date == "2026-04-07"
+
+
+def test_cli_app_rejects_reversed_backtest_range(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        ["mlpm", "backtest", "--start-date", "2026-04-07", "--end-date", "2026-04-01"],
+    )
+
+    with pytest.raises(SystemExit, match="backtest start_date must be on or before end_date"):
+        app()
+
+
+def test_cli_app_rejects_reversed_historical_eval_range(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "mlpm",
+            "historical-backtest-kalshi",
+            "--eval-start-date",
+            "2026-04-07",
+            "--eval-end-date",
+            "2026-04-01",
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="historical-backtest-kalshi eval start_date must be on or before end_date"):
+        app()

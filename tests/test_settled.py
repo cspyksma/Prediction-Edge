@@ -6,7 +6,11 @@ import uuid
 import pandas as pd
 
 from mlpm.config.settings import settings
-from mlpm.evaluation.settled import run_settled_prediction_report, run_settled_window_report
+from mlpm.evaluation.settled import (
+    compute_settled_calibration,
+    run_settled_prediction_report,
+    run_settled_window_report,
+)
 from mlpm.storage.duckdb import append_dataframe, connect
 
 
@@ -276,3 +280,97 @@ def test_run_settled_prediction_report_parameterizes_model_name(monkeypatch) -> 
     result = run_settled_prediction_report("2026-04-14", "2026-04-14", model_name="safe_model' OR 1=1 --")
 
     assert result == {"status": "insufficient_data", "rows": 0}
+
+
+def test_compute_settled_calibration_buckets_and_computes_abs_error(monkeypatch) -> None:
+    db_path = _workspace_db_path("calibration")
+    monkeypatch.setenv("DUCKDB_PATH", str(db_path))
+    settings.cache_clear()
+
+    conn = connect(settings().duckdb_path)
+    # Seed 4 games/home teams with two models spanning the probability range.
+    # Use games + predictions + results so settled_predictions_deduped picks them up.
+    append_dataframe(
+        conn,
+        "games",
+        pd.DataFrame(
+            [
+                {
+                    "game_id": f"g{i}",
+                    "game_date": f"2026-04-{10 + i:02d}",
+                    "event_start_time": f"2026-04-{10 + i:02d}T18:00:00",
+                    "away_team": f"A{i}",
+                    "home_team": f"H{i}",
+                    "snapshot_ts": f"2026-04-{10 + i:02d}T12:00:00",
+                    "collection_run_ts": f"2026-04-{10 + i:02d}T12:00:00",
+                }
+                for i in range(4)
+            ]
+        ),
+    )
+    preds = []
+    probs = [0.15, 0.45, 0.75, 0.95]
+    winners = ["A0", "A1", "H2", "H3"]  # only game 2 and 3 are home wins
+    for i, p in enumerate(probs):
+        preds.append(
+            {
+                "game_id": f"g{i}",
+                "snapshot_ts": f"2026-04-{10 + i:02d}T17:00:00",
+                "collection_run_ts": f"2026-04-{10 + i:02d}T17:00:00",
+                "team": f"H{i}",
+                "model_name": "modelX",
+                "model_prob": p,
+                "games_played_floor_pass": True,
+            }
+        )
+    append_dataframe(conn, "model_predictions", pd.DataFrame(preds))
+    append_dataframe(
+        conn,
+        "game_results",
+        pd.DataFrame(
+            [
+                {
+                    "game_id": f"g{i}",
+                    "game_date": f"2026-04-{10 + i:02d}",
+                    "away_team": f"A{i}",
+                    "home_team": f"H{i}",
+                    "winner_team": winners[i],
+                    "away_score": 1 if winners[i].startswith("H") else 3,
+                    "home_score": 3 if winners[i].startswith("H") else 1,
+                }
+                for i in range(4)
+            ]
+        ),
+    )
+    conn.close()
+
+    frame = compute_settled_calibration(model_name="modelX", bins=4)
+
+    assert not frame.empty
+    assert set(frame.columns) >= {
+        "model_name",
+        "bucket",
+        "bucket_lower",
+        "bucket_upper",
+        "games",
+        "avg_predicted_prob",
+        "actual_home_win_rate",
+        "abs_error",
+    }
+    # Each of our 4 games should land in its own bucket (bins=4 splits [0,1] evenly).
+    assert frame["games"].sum() == 4
+    # Abs error should equal |avg_predicted_prob - actual_home_win_rate| row by row.
+    for row in frame.itertuples():
+        assert abs(row.abs_error - abs(row.avg_predicted_prob - row.actual_home_win_rate)) < 1e-9
+
+
+def test_compute_settled_calibration_returns_empty_on_no_data(monkeypatch) -> None:
+    db_path = _workspace_db_path("calibration-empty")
+    monkeypatch.setenv("DUCKDB_PATH", str(db_path))
+    settings.cache_clear()
+    # Create schema but no data.
+    connect(settings().duckdb_path).close()
+
+    frame = compute_settled_calibration(bins=5)
+    assert frame.empty
+    assert "bucket" in frame.columns
