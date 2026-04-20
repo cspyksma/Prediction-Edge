@@ -20,5 +20,7 @@ data/raw/*
 data/processed/*
 data/*.duckdb
 data/*.duckdb*
+sbro/*.xlsx
+backtest*.xlsx
 !data/raw/.gitkeep
 !data/processed/.gitkeep

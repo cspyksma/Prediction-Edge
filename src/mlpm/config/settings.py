@@ -30,12 +30,15 @@ class Settings(BaseSettings):
     artifacts_dir: Path = Field(default=Path("artifacts"), alias="ARTIFACTS_DIR")
     mlflow_tracking_uri: str = Field(default="file:./mlruns", alias="MLFLOW_TRACKING_URI")
     model_home_field_edge_bps: int = Field(default=350, alias="MODEL_HOME_FIELD_EDGE_BPS")
-    model_min_games: int = Field(default=5, alias="MODEL_MIN_GAMES")
+    model_min_games: int = Field(default=25, alias="MODEL_MIN_GAMES")
     model_selection_metric: str = Field(default="log_loss", alias="MODEL_SELECTION_METRIC")
     model_train_start_date: str = Field(
         default_factory=lambda: f"{date.today().year}-03-01",
         alias="MODEL_TRAIN_START_DATE",
     )
+    kalshi_rate_limit_tier: str = Field(default="basic", alias="KALSHI_RATE_LIMIT_TIER")
+    kalshi_read_limit_per_second: int | None = Field(default=None, alias="KALSHI_READ_LIMIT_PER_SECOND")
+    kalshi_write_limit_per_second: int | None = Field(default=None, alias="KALSHI_WRITE_LIMIT_PER_SECOND")
 
 
 @lru_cache(maxsize=1)

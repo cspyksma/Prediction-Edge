@@ -108,8 +108,13 @@ Historical imports are resumable by default. Re-running the same command skips c
 - Team Elo.
 - Starter ERA, WHIP, strikeouts per 9, and walks per 9.
 - Bullpen recent workload features.
-- Market-implied prior (`market_home_implied_prob`).
 - Offense vs opposing starter handedness.
+- Stadium weather features when available.
+
+The core baseball model families are trained market-free by default. Market prices
+are used in evaluation, replay, and research flows, and some research contenders
+intentionally include market inputs when the objective is Kalshi ROI rather than
+pure winner prediction.
 
 ### Model families currently available
 
@@ -135,6 +140,32 @@ Historical imports are resumable by default. Re-running the same command skips c
 - `report-strategy-performance` settles those opportunities against actual winners using flat `1.0` unit stakes.
 - Champion/challenger reporting is available for current strategy summaries.
 
+### Historical and research backtests
+
+- `historical-backtest-kalshi` runs a fixed train/eval replay backtest against historical Kalshi quotes.
+- `walkforward-backtest` runs the monthly retrain SBRO walk-forward backtest.
+- `research-kalshi-edge` runs the database-first Kalshi edge research harness with:
+  - explicit train and eval windows
+  - baseball-only, hybrid, market-aware, market-only, and ensemble contenders
+  - multiple entry thresholds and sizing policies
+  - time-sliced out-of-sample Kalshi evaluation
+  - a research champion selected on Kalshi ROI with consistency guardrails
+
+Example:
+
+```bash
+python -m mlpm.cli research-kalshi-edge --train-start-date 2015-01-01 --train-end-date 2021-12-31 --eval-start-date 2025-01-01 --eval-end-date 2026-04-19
+```
+
+This command is database-first. It reads local DuckDB tables and does not refetch
+MLB fundamentals on every run. Backfill those first:
+
+```bash
+python -m mlpm.cli backfill-mlb --start-date 2015-01-01 --end-date 2026-04-19
+python -m mlpm.cli backfill-weather --start-date 2015-01-01 --end-date 2026-04-19
+python -m mlpm.cli ingest-sbro --directory sbro
+```
+
 ## Running Unattended
 
 - Use `python -m mlpm.cli run-service` for the durable collector process.
@@ -157,10 +188,14 @@ Main DuckDB tables:
 - `discrepancies`
 - `bet_opportunities`
 - `game_results`
+- `mlb_pitching_logs`
+- `mlb_batting_logs`
+- `game_weather`
 - `collector_runs`
 - `historical_import_runs`
 - `historical_polymarket_quotes`
 - `historical_kalshi_quotes`
+- `historical_market_priors`
 
 Important derived views:
 
@@ -169,6 +204,10 @@ Important derived views:
 - `model_predictions_deduped`
 - `discrepancies_deduped`
 - `game_results_deduped`
+- `mlb_pitching_logs_deduped`
+- `mlb_batting_logs_deduped`
+- `game_weather_deduped`
+- `historical_market_priors_deduped`
 - `settled_predictions_deduped`
 - `settled_prediction_daily`
 - `bet_opportunities_deduped`
@@ -196,6 +235,7 @@ Raw payloads are written under `data/raw/` and historical payloads under `data/r
 ## Public Release Checklist
 
 - Keep `.env`, `data/*.duckdb`, raw payloads, artifacts, MLflow runs, and temp/cache directories out of Git.
+- Keep local SBRO workbooks and generated backtest reports out of Git.
 - Review `.gitignore` before pushing any new local data collection outputs.
 - Treat the repo as code-only by default; do not publish collected market snapshots or databases unless you explicitly intend to.
 - Re-run the test suite before pushing significant changes:

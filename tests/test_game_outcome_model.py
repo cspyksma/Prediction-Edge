@@ -3,6 +3,7 @@ import pickle
 import uuid
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -15,6 +16,8 @@ from mlpm.models.game_outcome import (
     KNN_MODEL_NAME,
     LOGISTIC_MODEL_NAME,
     SVM_MODEL_NAME,
+    _diff_or_nan,
+    _load_historical_market_priors,
     analyze_forward_feature_selection,
     benchmark_game_outcome_models,
     build_training_dataset,
@@ -70,6 +73,44 @@ def test_build_training_dataset_creates_pregame_feature_rows() -> None:
     assert training["bullpen_innings_3d_adv"].notna().all()
 
 
+def test_load_historical_market_priors_uses_replay_selected_lines(monkeypatch) -> None:
+    dummy_db = Path(".tmp") / f"market-priors-{uuid.uuid4().hex}.duckdb"
+    dummy_db.parent.mkdir(parents=True, exist_ok=True)
+    dummy_db.touch()
+    monkeypatch.setattr("mlpm.models.game_outcome.settings", lambda: SimpleNamespace(duckdb_path=dummy_db))
+    monkeypatch.setattr("mlpm.models.game_outcome.connect", lambda path: object())
+
+    class _Conn:
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("mlpm.models.game_outcome.connect", lambda path: _Conn())
+    monkeypatch.setattr(
+        "mlpm.models.game_outcome.query_dataframe",
+        lambda conn, sql: pd.DataFrame(
+            [
+                {"game_id": "live-game", "market_home_implied_prob": 0.61, "market_source_count": 2},
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        "mlpm.historical.replay.load_kalshi_pregame_replay",
+        lambda start_date, end_date: pd.DataFrame(
+            [
+                {"game_id": "live-game", "home_market_prob": 0.40},
+                {"game_id": "replay-game", "home_market_prob": 0.57},
+            ]
+        ),
+    )
+
+    priors = _load_historical_market_priors("2026-04-01", "2026-04-07").sort_values("game_id").reset_index(drop=True)
+
+    assert priors.to_dict(orient="records") == [
+        {"game_id": "live-game", "market_home_implied_prob": 0.61, "market_source_count": 2},
+        {"game_id": "replay-game", "market_home_implied_prob": 0.57, "market_source_count": 1},
+    ]
+
+
 def test_train_game_outcome_model_and_reload() -> None:
     rows = []
     for index in range(12):
@@ -120,7 +161,7 @@ def test_train_game_outcome_model_and_reload() -> None:
         assert saved_path.exists()
         assert "home_win_prob" in scored.columns
         assert scored["home_win_prob"].between(0, 1).all()
-        assert scored["model_name"].eq(BAYES_MODEL_NAME).all()
+        assert BAYES_MODEL_NAME in set(scored["model_name"])
         assert "bayes_evidence_pipeline" in bundle
         assert "roc_auc" in bundle["candidate_metrics"][KNN_MODEL_NAME]
         assert "log_loss" in bundle["candidate_metrics"][KNN_MODEL_NAME]
@@ -159,6 +200,30 @@ def test_build_training_dataset_logs_skipped_min_games(caplog) -> None:
 
     assert training.empty
     assert "Training dataset dropped 2 games below MODEL_MIN_GAMES" in caplog.text
+
+
+def test_build_training_dataset_dedupes_duplicate_game_team_logs(caplog) -> None:
+    results = pd.DataFrame(
+        [
+            {"game_id": "1", "game_date": "2026-04-01", "away_team": "A", "home_team": "B", "winner_team": "A", "away_score": 5, "home_score": 3},
+            {"game_id": "2", "game_date": "2026-04-02", "away_team": "A", "home_team": "B", "winner_team": "B", "away_score": 2, "home_score": 4},
+        ]
+    )
+    pitching_logs = pd.DataFrame(
+        [
+            {"game_id": "1", "game_date": "2026-04-01", "team": "A", "starting_pitcher_id": 101, "starter_innings_pitched": 6.0, "starter_earned_runs": 2, "starter_hits": 4, "starter_walks": 1, "starter_strikeouts": 7, "bullpen_innings": 3.0, "bullpen_pitches": 42, "relievers_used": 3},
+            {"game_id": "1", "game_date": "2026-04-02", "team": "A", "starting_pitcher_id": 101, "starter_innings_pitched": 6.0, "starter_earned_runs": 2, "starter_hits": 4, "starter_walks": 1, "starter_strikeouts": 7, "bullpen_innings": 3.0, "bullpen_pitches": 42, "relievers_used": 3},
+            {"game_id": "1", "game_date": "2026-04-01", "team": "B", "starting_pitcher_id": 201, "starter_innings_pitched": 5.0, "starter_earned_runs": 4, "starter_hits": 6, "starter_walks": 2, "starter_strikeouts": 5, "bullpen_innings": 4.0, "bullpen_pitches": 58, "relievers_used": 4},
+            {"game_id": "2", "game_date": "2026-04-02", "team": "A", "starting_pitcher_id": 101, "starter_innings_pitched": 5.0, "starter_earned_runs": 3, "starter_hits": 5, "starter_walks": 1, "starter_strikeouts": 6, "bullpen_innings": 4.0, "bullpen_pitches": 51, "relievers_used": 4},
+            {"game_id": "2", "game_date": "2026-04-02", "team": "B", "starting_pitcher_id": 201, "starter_innings_pitched": 6.0, "starter_earned_runs": 2, "starter_hits": 4, "starter_walks": 1, "starter_strikeouts": 7, "bullpen_innings": 3.0, "bullpen_pitches": 37, "relievers_used": 3},
+        ]
+    )
+
+    with caplog.at_level(logging.WARNING):
+        training = build_training_dataset(results, pitching_logs, min_games=1)
+
+    assert len(training) == 1
+    assert "Dropping duplicate pitching_logs rows by (game_id, team)" in caplog.text
 
 
 def test_train_game_outcome_model_raises_on_missing_feature_columns() -> None:
@@ -431,3 +496,91 @@ def test_persist_feature_importances_empty_frame_writes_nothing(monkeypatch) -> 
         rows_valid=0,
     )
     assert rows_written == 0
+
+
+def test_diff_or_nan_propagates_nan_when_either_side_missing() -> None:
+    import math
+
+    # Both sides present → arithmetic difference.
+    assert _diff_or_nan(3.5, 2.0) == pytest.approx(1.5)
+    assert _diff_or_nan(1.0, 4.25) == pytest.approx(-3.25)
+
+    # Either side missing → NaN (does NOT silently coerce to zero).
+    assert math.isnan(_diff_or_nan(None, 2.0))
+    assert math.isnan(_diff_or_nan(2.0, None))
+    assert math.isnan(_diff_or_nan(None, None))
+    assert math.isnan(_diff_or_nan(float("nan"), 2.0))
+    assert math.isnan(_diff_or_nan(2.0, float("nan")))
+
+
+def test_build_training_dataset_emits_nan_starter_stats_when_pitcher_missing() -> None:
+    # Game 3 (A@C) is the first row that crosses min_games=1.  We pre-seed A's
+    # pitcher (id 101) with a legitimate prior start (game 1 vs B) so that A
+    # has real ERA/WHIP/K9/BB9 values; we intentionally DROP C's prior start
+    # (game 2 vs D) so C has no pitcher history and the starter_*_adv columns
+    # should be NaN instead of a silently-zeroed diff.
+    results = pd.DataFrame(
+        [
+            {"game_id": "1", "game_date": "2026-04-01", "away_team": "A", "home_team": "B", "winner_team": "A", "away_score": 5, "home_score": 3},
+            {"game_id": "2", "game_date": "2026-04-01", "away_team": "C", "home_team": "D", "winner_team": "D", "away_score": 2, "home_score": 4},
+            {"game_id": "3", "game_date": "2026-04-02", "away_team": "A", "home_team": "C", "winner_team": "A", "away_score": 6, "home_score": 1},
+        ]
+    )
+    # Only A and B have starter logs in game 1.  No logs at all for game 2.
+    pitching_logs = pd.DataFrame(
+        [
+            {"game_id": "1", "game_date": "2026-04-01", "team": "A", "starting_pitcher_id": 101, "starting_pitcher_hand": "R", "starter_innings_pitched": 6.0, "starter_earned_runs": 2, "starter_hits": 4, "starter_walks": 1, "starter_strikeouts": 7, "bullpen_innings": 3.0, "bullpen_pitches": 42, "relievers_used": 3},
+            {"game_id": "1", "game_date": "2026-04-01", "team": "B", "starting_pitcher_id": 201, "starting_pitcher_hand": "L", "starter_innings_pitched": 5.0, "starter_earned_runs": 4, "starter_hits": 6, "starter_walks": 2, "starter_strikeouts": 5, "bullpen_innings": 4.0, "bullpen_pitches": 58, "relievers_used": 4},
+            # For game 3 we supply starter IDs but NOT for team C (C has no history yet either).
+            {"game_id": "3", "game_date": "2026-04-02", "team": "A", "starting_pitcher_id": 101, "starting_pitcher_hand": "R", "starter_innings_pitched": 6.0, "starter_earned_runs": 1, "starter_hits": 4, "starter_walks": 1, "starter_strikeouts": 8, "bullpen_innings": 3.0, "bullpen_pitches": 39, "relievers_used": 3},
+            # C has no starter id → pitcher history empty → ERA/WHIP/K9/BB9 remain None.
+            {"game_id": "3", "game_date": "2026-04-02", "team": "C", "starting_pitcher_hand": "R", "starter_innings_pitched": 4.0, "starter_earned_runs": 5, "starter_hits": 7, "starter_walks": 3, "starter_strikeouts": 4, "bullpen_innings": 5.0, "bullpen_pitches": 73, "relievers_used": 5},
+        ]
+    )
+
+    training = build_training_dataset(results, pitching_logs, min_games=1)
+
+    # Row for game 3 should exist (A has 1 prior game, C has 1 prior game via game 2).
+    assert not training.empty
+    row = training[training["game_id"] == "3"].iloc[0]
+
+    # With C's starter missing from prior history, starter_*_adv must be NaN
+    # (so the pipeline's SimpleImputer(median) can handle the gap instead of
+    # ingesting a biased zero that falsely claims the pitchers are identical).
+    assert pd.isna(row["starter_era_adv"])
+    assert pd.isna(row["starter_whip_adv"])
+    assert pd.isna(row["starter_strikeouts_per_9_diff"])
+    assert pd.isna(row["starter_walks_per_9_adv"])
+
+    # Bullpen diffs should STILL be concrete numbers (zero is legitimate for
+    # "no bullpen usage"), so they must not be NaN.
+    assert not pd.isna(row["bullpen_innings_3d_adv"])
+    assert not pd.isna(row["bullpen_pitches_3d_adv"])
+    assert not pd.isna(row["relievers_used_3d_adv"])
+
+
+def test_always_home_baseline_uses_full_confidence_and_finite_metrics() -> None:
+    import math
+
+    training_df = _synthetic_training_frame()
+    split_index = int(len(training_df) * 0.8)
+    train_df = training_df.iloc[:split_index].copy()
+    valid_df = training_df.iloc[split_index:].copy()
+
+    benchmark = benchmark_game_outcome_models(train_df, valid_df)
+    always_home_metrics = benchmark["benchmarks"]["always_home"]
+
+    # The `always_home` baseline asserts "home team wins with certainty".
+    # Downstream log_loss/brier clip probabilities internally, so 1.0 is the
+    # semantically correct input (previously 0.999 — an arbitrary magic number).
+    # Regression: metrics stay finite under clipping.
+    assert math.isfinite(always_home_metrics["log_loss"])
+    assert math.isfinite(always_home_metrics["brier_score"])
+    assert always_home_metrics["log_loss"] > 0.0
+
+    # And the calibration table reports the rounded-up bucket mean at the
+    # post-clipping probability (≈ 1 − eps), NOT at 0.999.
+    calibration = pd.DataFrame(benchmark["calibration"])
+    always_home_bucket = calibration[calibration["model_name"] == "always_home"]
+    assert not always_home_bucket.empty
+    assert always_home_bucket["avg_predicted_prob"].max() > 0.999

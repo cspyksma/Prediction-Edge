@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -18,6 +19,7 @@ from mlpm.historical.common import (
 )
 from mlpm.historical.normalize_kalshi_history import normalize_kalshi_candle_payload
 from mlpm.ingest.kalshi import KALSHI_MLB_GAME_SERIES
+from mlpm.ingest.kalshi_rate_limits import KalshiRateLimiter, resolve_kalshi_rate_limits
 from mlpm.ingest.mlb_stats import fetch_final_results
 from mlpm.normalize.mapping import canonicalize_team_name, team_aliases
 from mlpm.storage.duckdb import append_dataframe, connect
@@ -29,6 +31,7 @@ KALSHI_HISTORICAL_CUTOFF_URL = f"{KALSHI_BASE_URL}/historical/cutoff"
 KALSHI_HISTORICAL_MARKETS_URL = f"{KALSHI_BASE_URL}/historical/markets"
 KALSHI_HISTORICAL_CANDLES_URL = f"{KALSHI_BASE_URL}/historical/markets/{{ticker}}/candlesticks"
 KALSHI_HISTORICAL_TRADES_URL = f"{KALSHI_BASE_URL}/historical/trades"
+KALSHI_TICKER_PREDICTION_START_YEAR = 2025
 KALSHI_TEAM_CODES = {
     "Arizona Diamondbacks": "ARI",
     "Atlanta Braves": "ATL",
@@ -63,9 +66,39 @@ KALSHI_TEAM_CODES = {
 }
 
 
+_RETRY_DELAYS = (5, 15, 30, 60)  # seconds to wait after each successive 429
+
+
+def _get_with_backoff(
+    client: httpx.Client,
+    url: str,
+    params: dict | None = None,
+    *,
+    rate_limiter: KalshiRateLimiter | None = None,
+) -> httpx.Response:
+    """GET with exponential backoff on 429 Too Many Requests."""
+    for attempt, delay in enumerate(_RETRY_DELAYS):
+        response = rate_limiter.get(client, url, params=params) if rate_limiter else client.get(url, params=params)
+        if response.status_code != 429:
+            return response
+        wait = delay
+        # Honour Retry-After header when present
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                wait = max(int(retry_after), delay)
+            except ValueError:
+                pass
+        print(f"  [rate limit] 429 on {url} — waiting {wait}s (attempt {attempt + 1}/{len(_RETRY_DELAYS)})")
+        time.sleep(wait)
+    # Final attempt after all delays exhausted
+    return rate_limiter.get(client, url, params=params) if rate_limiter else client.get(url, params=params)
+
+
 def get_kalshi_historical_cutoff() -> dict:
+    rate_limiter = KalshiRateLimiter(read_limit=resolve_kalshi_rate_limits().read_limit)
     with httpx.Client(timeout=30.0) as client:
-        response = client.get(KALSHI_HISTORICAL_CUTOFF_URL)
+        response = rate_limiter.get(client, KALSHI_HISTORICAL_CUTOFF_URL)
         response.raise_for_status()
         return response.json()
 
@@ -159,7 +192,7 @@ def _backfill_kalshi_history_chunk(
                 "parse_error_count": parse_error_count,
             }
         historical_cutoff = get_kalshi_historical_cutoff()
-        candidates = discover_kalshi_markets_for_games(games, historical_cutoff=historical_cutoff)
+        candidates = build_kalshi_market_candidates(games, historical_cutoff=historical_cutoff)
         candidate_markets = int(len(candidates))
         games_with_markets = int(candidates["game_id"].nunique()) if not candidates.empty else 0
         if candidates.empty:
@@ -178,12 +211,14 @@ def _backfill_kalshi_history_chunk(
                 "parse_error_count": parse_error_count,
             }
         with httpx.Client(timeout=30.0) as client:
+            rate_limiter = KalshiRateLimiter(read_limit=resolve_kalshi_rate_limits().read_limit)
             for row in candidates.to_dict(orient="records"):
                 historical_mode = _should_use_historical_market(row, historical_cutoff)
                 market_payload, market_status = fetch_kalshi_market(
                     row["ticker"],
                     client=client,
                     historical=historical_mode,
+                    rate_limiter=rate_limiter,
                 )
                 if market_status == "rate_limited":
                     rate_limited_count += 1
@@ -206,6 +241,7 @@ def _backfill_kalshi_history_chunk(
                     period_interval=period_interval,
                     client=client,
                     historical=historical_mode,
+                    rate_limiter=rate_limiter,
                 )
                 if candle_status == "rate_limited":
                     rate_limited_count += 1
@@ -245,6 +281,7 @@ def _backfill_kalshi_history_chunk(
                         end_ts,
                         ticker=row["ticker"],
                         client=client,
+                        rate_limiter=rate_limiter,
                     )
                     request_count += 1
                     payload_count += 1
@@ -303,18 +340,19 @@ def fetch_kalshi_market(
     ticker: str,
     client: httpx.Client | None = None,
     historical: bool = True,
+    rate_limiter: KalshiRateLimiter | None = None,
 ) -> tuple[dict, str]:
     owns_client = client is None
     client = client or httpx.Client(timeout=30.0)
     try:
-        if historical:
-            response = client.get(f"{KALSHI_HISTORICAL_MARKETS_URL}/{ticker}")
-        else:
-            response = client.get(f"{KALSHI_MARKETS_URL}/{ticker}")
+        base_url = KALSHI_HISTORICAL_MARKETS_URL if historical else KALSHI_MARKETS_URL
+        response = _get_with_backoff(client, f"{base_url}/{ticker}", rate_limiter=rate_limiter)
         if response.status_code in (400, 404):
-            response = client.get(
-                KALSHI_HISTORICAL_MARKETS_URL if historical else KALSHI_MARKETS_URL,
+            response = _get_with_backoff(
+                client,
+                base_url,
                 params={"tickers": ticker, "limit": 1},
+                rate_limiter=rate_limiter,
             )
         if response.status_code in (400, 404):
             return {}, "missing"
@@ -334,16 +372,22 @@ def fetch_kalshi_candles(
     period_interval: int = 1,
     client: httpx.Client | None = None,
     historical: bool = True,
+    rate_limiter: KalshiRateLimiter | None = None,
 ) -> tuple[dict, str]:
     owns_client = client is None
     client = client or httpx.Client(timeout=30.0)
     try:
-        response = client.get(
-            (KALSHI_HISTORICAL_CANDLES_URL if historical else KALSHI_CANDLES_URL).format(ticker=ticker),
+        url = (KALSHI_HISTORICAL_CANDLES_URL if historical else KALSHI_CANDLES_URL).format(ticker=ticker)
+        response = _get_with_backoff(
+            client,
+            url,
             params={"start_ts": start_ts, "end_ts": end_ts, "period_interval": period_interval},
+            rate_limiter=rate_limiter,
         )
-        if response.status_code in (400, 404, 429):
-            return {}, "rate_limited" if response.status_code == 429 else "missing"
+        if response.status_code in (400, 404):
+            return {}, "missing"
+        if response.status_code == 429:
+            return {}, "rate_limited"
         response.raise_for_status()
         return response.json(), "ok"
     finally:
@@ -356,6 +400,7 @@ def fetch_kalshi_historical_trades(
     end_ts: int,
     ticker: str | None = None,
     client: httpx.Client | None = None,
+    rate_limiter: KalshiRateLimiter | None = None,
 ) -> dict:
     owns_client = client is None
     client = client or httpx.Client(timeout=30.0)
@@ -363,7 +408,10 @@ def fetch_kalshi_historical_trades(
         params: dict[str, object] = {"start_ts": start_ts, "end_ts": end_ts}
         if ticker:
             params["ticker"] = ticker
-        response = client.get(KALSHI_HISTORICAL_TRADES_URL, params=params)
+        response = rate_limiter.get(client, KALSHI_HISTORICAL_TRADES_URL, params=params) if rate_limiter else client.get(
+            KALSHI_HISTORICAL_TRADES_URL,
+            params=params,
+        )
         response.raise_for_status()
         return response.json()
     finally:
@@ -390,6 +438,7 @@ def discover_kalshi_markets_for_games(
         cutoff_dt = _parse_market_time(historical_cutoff.get("market_settled_ts"))
         historical_mode = bool(cutoff_dt is not None and max_start is not None and max_start <= cutoff_dt)
     with httpx.Client(timeout=30.0) as client:
+        rate_limiter = KalshiRateLimiter(read_limit=resolve_kalshi_rate_limits().read_limit)
         cursor: str | None = None
         seen_in_range = False
         while True:
@@ -398,9 +447,14 @@ def discover_kalshi_markets_for_games(
                 params["status"] = "settled"
             if cursor:
                 params["cursor"] = cursor
-            response = client.get(KALSHI_HISTORICAL_MARKETS_URL if historical_mode else KALSHI_MARKETS_URL, params=params)
+            response = _get_with_backoff(
+                client,
+                KALSHI_HISTORICAL_MARKETS_URL if historical_mode else KALSHI_MARKETS_URL,
+                params=params,
+                rate_limiter=rate_limiter,
+            )
             if response.status_code == 429:
-                break
+                return pd.DataFrame(rows)
             response.raise_for_status()
             payload = response.json()
             markets = payload.get("markets", payload.get("data", []))
@@ -432,13 +486,63 @@ def discover_kalshi_markets_for_games(
     return pd.DataFrame(rows)
 
 
+def build_kalshi_market_candidates(
+    games_df: pd.DataFrame,
+    historical_cutoff: dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    if games_df.empty:
+        return pd.DataFrame()
+
+    predictable_games, _ = split_kalshi_ticker_prediction_games(games_df)
+    frames: list[pd.DataFrame] = []
+    discovered = discover_kalshi_markets_for_games(games_df, historical_cutoff=historical_cutoff)
+    if not discovered.empty:
+        frames.append(discovered)
+    if not predictable_games.empty:
+        # Catalog discovery is more reliable for older and replayed contracts.
+        # Only fall back to direct ticker construction for 2025+ games that
+        # discovery did not already cover at all.
+        discovery_game_ids: set[str] = set()
+        if not discovered.empty:
+            discovery_game_ids = {str(game_id) for game_id in discovered["game_id"].tolist()}
+        predicted = build_kalshi_ticker_candidates(predictable_games)
+        if not predicted.empty and discovery_game_ids:
+            predicted = predicted.loc[~predicted["game_id"].astype(str).isin(discovery_game_ids)].copy()
+        if not predicted.empty:
+            frames.append(predicted)
+    if not frames:
+        return pd.DataFrame()
+
+    combined = pd.concat([frame for frame in frames if not frame.empty], ignore_index=True)
+    if combined.empty:
+        return combined
+    return combined.drop_duplicates(subset=["ticker", "game_id"], keep="first")
+
+
+def split_kalshi_ticker_prediction_games(games_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if games_df.empty:
+        return games_df.copy(), games_df.copy()
+
+    game_times = _game_start_series(games_df)
+    prediction_mask = game_times.dt.year.ge(KALSHI_TICKER_PREDICTION_START_YEAR).fillna(False)
+    return (
+        games_df.loc[prediction_mask].copy(),
+        games_df.loc[~prediction_mask].copy(),
+    )
+
+
 def build_kalshi_ticker_candidates(games_df: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for game in games_df.to_dict(orient="records"):
         start_time = _parse_market_time(game.get("event_start_time"))
         away_code = KALSHI_TEAM_CODES.get(str(game.get("away_team") or ""))
         home_code = KALSHI_TEAM_CODES.get(str(game.get("home_team") or ""))
-        if start_time is None or away_code is None or home_code is None:
+        if (
+            start_time is None
+            or start_time.year < KALSHI_TICKER_PREDICTION_START_YEAR
+            or away_code is None
+            or home_code is None
+        ):
             continue
         base = f"{KALSHI_MLB_GAME_SERIES}-{start_time.strftime('%y%b%d%H%M').upper()}{away_code}{home_code}"
         rows.append(

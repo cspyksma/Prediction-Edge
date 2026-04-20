@@ -52,7 +52,9 @@ FEATURE_COLUMNS = [
     "streak_diff",
     "elo_diff",
     "elo_home_win_prob",
-    "market_home_implied_prob",
+    # market_home_implied_prob intentionally excluded: the model must not
+    # train on the market we're trying to beat. It remains on training frames
+    # for diagnostics but is never fed to any estimator.
     "offense_vs_starter_hand_diff",
     "starter_era_adv",
     "starter_whip_adv",
@@ -61,7 +63,27 @@ FEATURE_COLUMNS = [
     "bullpen_innings_3d_adv",
     "bullpen_pitches_3d_adv",
     "relievers_used_3d_adv",
+    # Stadium-weather features (symmetric env factors; the model still gets a
+    # per-game read on conditions because bats/pitching mixes respond
+    # differently to temp/wind/humidity/rain). NaN -> median-imputed by the
+    # classifier pipelines, so games without weather rows are safe.
+    "weather_temp_f",
+    "weather_wind_out_to_cf_mph",
+    "weather_humidity_pct",
+    "weather_precipitation_in",
+    "weather_is_dome_sealed",
 ]
+
+# Default values for games where weather data is missing (e.g. a 2015 game
+# whose stadium lookup fails). These match the neutral dome defaults so the
+# model treats "no weather" similarly to "climate-controlled indoor".
+_WEATHER_FEATURE_DEFAULTS: dict[str, float] = {
+    "weather_temp_f": 72.0,
+    "weather_wind_out_to_cf_mph": 0.0,
+    "weather_humidity_pct": 50.0,
+    "weather_precipitation_in": 0.0,
+    "weather_is_dome_sealed": 0.0,
+}
 BAYES_EVIDENCE_FEATURE_COLUMNS = [column for column in FEATURE_COLUMNS if column != "market_home_implied_prob"]
 STARTER_LOOKBACK_GAMES = 5
 
@@ -140,12 +162,15 @@ def save_trained_model(bundle: dict[str, object], path: Path | None = None) -> P
     return model_path
 
 
-def fetch_training_inputs(start_date: str, end_date: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def fetch_training_inputs(
+    start_date: str, end_date: str
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     return (
         fetch_final_results(start_date, end_date),
         fetch_game_pitching_logs(start_date, end_date),
         fetch_game_batting_logs(start_date, end_date),
         _load_historical_market_priors(start_date, end_date),
+        _load_game_weather(start_date, end_date),
     )
 
 
@@ -154,6 +179,7 @@ def build_training_dataset(
     pitching_logs_df: pd.DataFrame,
     batting_logs_df: pd.DataFrame | None = None,
     market_priors_df: pd.DataFrame | None = None,
+    weather_df: pd.DataFrame | None = None,
     min_games: int | None = None,
 ) -> pd.DataFrame:
     if results_df.empty:
@@ -167,6 +193,7 @@ def build_training_dataset(
     pitching_logs = pitching_logs_df.copy()
     if not pitching_logs.empty:
         pitching_logs["game_date"] = pd.to_datetime(pitching_logs["game_date"])
+        pitching_logs = _dedupe_game_team_logs(pitching_logs, frame_name="pitching_logs")
         pitching_lookup = pitching_logs.set_index(["game_id", "team"]).to_dict(orient="index")
     else:
         pitching_lookup = {}
@@ -174,12 +201,24 @@ def build_training_dataset(
     if batting_logs_df is not None and not batting_logs_df.empty:
         batting_logs = batting_logs_df.copy()
         batting_logs["game_date"] = pd.to_datetime(batting_logs["game_date"])
+        batting_logs = _dedupe_game_team_logs(batting_logs, frame_name="batting_logs")
         batting_lookup = batting_logs.set_index(["game_id", "team"]).to_dict(orient="index")
     market_prior_lookup: dict[str, float] = {}
     if market_priors_df is not None and not market_priors_df.empty:
         market_prior_lookup = (
             market_priors_df.drop_duplicates(subset=["game_id"]).set_index("game_id")["market_home_implied_prob"].to_dict()
         )
+    weather_lookup: dict[str, dict[str, float]] = {}
+    if weather_df is not None and not weather_df.empty:
+        weather_cols = [
+            col for col in _WEATHER_FEATURE_DEFAULTS.keys() if col in weather_df.columns
+        ]
+        if weather_cols:
+            weather_lookup = (
+                weather_df.drop_duplicates(subset=["game_id"])
+                .set_index("game_id")[weather_cols]
+                .to_dict(orient="index")
+            )
 
     team_history: dict[str, list[dict[str, object]]] = {}
     pitcher_history: dict[int, list[dict[str, float]]] = {}
@@ -221,6 +260,7 @@ def build_training_dataset(
                         market_home_implied_prob=_market_home_implied_prob(market_prior_lookup.get(game["game_id"])),
                         home_offense_vs_opp_hand=home_offense_vs_opp_hand,
                         away_offense_vs_opp_hand=away_offense_vs_opp_hand,
+                        weather=weather_lookup.get(game["game_id"]),
                     ),
                 }
             )
@@ -248,6 +288,22 @@ def build_training_dataset(
             minimum_games,
         )
     return training_df
+
+
+def _dedupe_game_team_logs(frame: pd.DataFrame, *, frame_name: str) -> pd.DataFrame:
+    if frame.empty or not {"game_id", "team"}.issubset(frame.columns):
+        return frame
+    duplicate_mask = frame.duplicated(subset=["game_id", "team"], keep=False)
+    if not duplicate_mask.any():
+        return frame
+    logger.warning(
+        "Dropping duplicate %s rows by (game_id, team); duplicate_rows=%s",
+        frame_name,
+        int(duplicate_mask.sum()),
+    )
+    sort_columns = [column for column in ("game_date", "game_id", "team") if column in frame.columns]
+    deduped = frame.sort_values(sort_columns).drop_duplicates(subset=["game_id", "team"], keep="last")
+    return deduped.reset_index(drop=True)
 
 
 def train_game_outcome_model(training_df: pd.DataFrame) -> dict[str, object]:
@@ -321,8 +377,14 @@ def train_game_outcome_model(training_df: pd.DataFrame) -> dict[str, object]:
 
 
 def train_and_save_model(start_date: str, end_date: str, path: Path | None = None) -> dict[str, object]:
-    results_df, pitching_logs_df, batting_logs_df, market_priors_df = fetch_training_inputs(start_date, end_date)
-    training_df = build_training_dataset(results_df, pitching_logs_df, batting_logs_df=batting_logs_df, market_priors_df=market_priors_df)
+    results_df, pitching_logs_df, batting_logs_df, market_priors_df, weather_df = fetch_training_inputs(start_date, end_date)
+    training_df = build_training_dataset(
+        results_df,
+        pitching_logs_df,
+        batting_logs_df=batting_logs_df,
+        market_priors_df=market_priors_df,
+        weather_df=weather_df,
+    )
     bundle = train_game_outcome_model(training_df)
     saved_path = save_trained_model(bundle, path=path)
 
@@ -351,8 +413,14 @@ def train_and_save_model(start_date: str, end_date: str, path: Path | None = Non
 
 
 def run_model_benchmark(start_date: str, end_date: str) -> dict[str, object]:
-    results_df, pitching_logs_df, batting_logs_df, market_priors_df = fetch_training_inputs(start_date, end_date)
-    training_df = build_training_dataset(results_df, pitching_logs_df, batting_logs_df=batting_logs_df, market_priors_df=market_priors_df)
+    results_df, pitching_logs_df, batting_logs_df, market_priors_df, weather_df = fetch_training_inputs(start_date, end_date)
+    training_df = build_training_dataset(
+        results_df,
+        pitching_logs_df,
+        batting_logs_df=batting_logs_df,
+        market_priors_df=market_priors_df,
+        weather_df=weather_df,
+    )
     if training_df.empty:
         return {"status": "insufficient_data", "rows": 0}
     _require_feature_columns(training_df)
@@ -392,11 +460,13 @@ def run_historical_kalshi_backtest(
     pitching_logs_df = fetch_game_pitching_logs(train_start_date, eval_end_date)
     batting_logs_df = fetch_game_batting_logs(train_start_date, eval_end_date)
     market_priors_df = replay_df[["game_id", "home_market_prob"]].rename(columns={"home_market_prob": "market_home_implied_prob"})
+    weather_df = _load_game_weather(train_start_date, eval_end_date)
     training_df = build_training_dataset(
         combined_results_df,
         pitching_logs_df,
         batting_logs_df=batting_logs_df,
         market_priors_df=market_priors_df,
+        weather_df=weather_df,
     )
     if training_df.empty:
         return {"status": "insufficient_data", "rows": 0, "message": "Training dataset is empty."}
@@ -524,8 +594,14 @@ def run_historical_kalshi_backtest(
 
 
 def run_forward_feature_selection(start_date: str, end_date: str) -> dict[str, object]:
-    results_df, pitching_logs_df, batting_logs_df, market_priors_df = fetch_training_inputs(start_date, end_date)
-    training_df = build_training_dataset(results_df, pitching_logs_df, batting_logs_df=batting_logs_df, market_priors_df=market_priors_df)
+    results_df, pitching_logs_df, batting_logs_df, market_priors_df, weather_df = fetch_training_inputs(start_date, end_date)
+    training_df = build_training_dataset(
+        results_df,
+        pitching_logs_df,
+        batting_logs_df=batting_logs_df,
+        market_priors_df=market_priors_df,
+        weather_df=weather_df,
+    )
     if training_df.empty:
         return {"status": "insufficient_data", "rows": 0}
     return analyze_forward_feature_selection(training_df)
@@ -582,34 +658,35 @@ def benchmark_game_outcome_models(
         valid_df,
     )
     home_win_rate = float(train_df["target_home_win"].mean())
+    heuristic_frame = valid_df[FEATURE_COLUMNS].fillna(0.0)
     heuristic_score = (
-        (valid_df["season_win_pct_diff"] * HEURISTIC_WEIGHT_SEASON_WIN_PCT)
-        + (valid_df["recent_win_pct_diff"] * HEURISTIC_WEIGHT_RECENT_WIN_PCT)
-        + (valid_df["venue_win_pct_diff"] * HEURISTIC_WEIGHT_VENUE_WIN_PCT)
-        + (valid_df["run_diff_per_game_diff"] * HEURISTIC_WEIGHT_RUN_DIFF)
-        + (valid_df["season_runs_scored_per_game_diff"] * HEURISTIC_WEIGHT_SEASON_RUNS_SCORED)
-        + (valid_df["season_runs_allowed_per_game_adv"] * HEURISTIC_WEIGHT_SEASON_RUNS_ALLOWED)
-        + (valid_df["recent_runs_scored_per_game_diff"] * HEURISTIC_WEIGHT_RECENT_RUNS_SCORED)
-        + (valid_df["recent_runs_allowed_per_game_adv"] * HEURISTIC_WEIGHT_RECENT_RUNS_ALLOWED)
-        + (valid_df["rest_days_diff"] * HEURISTIC_WEIGHT_REST_DAYS)
-        + (valid_df["venue_streak_diff"] * HEURISTIC_WEIGHT_VENUE_STREAK)
-        + (valid_df["travel_switch_adv"] * HEURISTIC_WEIGHT_TRAVEL_SWITCH)
-        - (valid_df["doubleheader_flag"] * HEURISTIC_WEIGHT_DOUBLEHEADER)
-        + (valid_df["streak_diff"] * HEURISTIC_WEIGHT_STREAK)
-        + (valid_df["elo_diff"] / HEURISTIC_ELO_DIFF_DIVISOR)
-        + ((valid_df["elo_home_win_prob"] - 0.5) * HEURISTIC_ELO_PROB_CENTER_WEIGHT)
-        + (valid_df["starter_era_adv"] * HEURISTIC_WEIGHT_STARTER_ERA)
-        + (valid_df["starter_whip_adv"] * HEURISTIC_WEIGHT_STARTER_WHIP)
-        + (valid_df["starter_strikeouts_per_9_diff"] * HEURISTIC_WEIGHT_STARTER_K9)
-        + (valid_df["starter_walks_per_9_adv"] * HEURISTIC_WEIGHT_STARTER_BB9)
-        + (valid_df["bullpen_innings_3d_adv"] * HEURISTIC_WEIGHT_BULLPEN_INNINGS)
-        + (valid_df["bullpen_pitches_3d_adv"] / HEURISTIC_BULLPEN_PITCHES_DIVISOR)
-        + (valid_df["relievers_used_3d_adv"] * HEURISTIC_WEIGHT_RELIEVERS_USED)
+        (heuristic_frame["season_win_pct_diff"] * HEURISTIC_WEIGHT_SEASON_WIN_PCT)
+        + (heuristic_frame["recent_win_pct_diff"] * HEURISTIC_WEIGHT_RECENT_WIN_PCT)
+        + (heuristic_frame["venue_win_pct_diff"] * HEURISTIC_WEIGHT_VENUE_WIN_PCT)
+        + (heuristic_frame["run_diff_per_game_diff"] * HEURISTIC_WEIGHT_RUN_DIFF)
+        + (heuristic_frame["season_runs_scored_per_game_diff"] * HEURISTIC_WEIGHT_SEASON_RUNS_SCORED)
+        + (heuristic_frame["season_runs_allowed_per_game_adv"] * HEURISTIC_WEIGHT_SEASON_RUNS_ALLOWED)
+        + (heuristic_frame["recent_runs_scored_per_game_diff"] * HEURISTIC_WEIGHT_RECENT_RUNS_SCORED)
+        + (heuristic_frame["recent_runs_allowed_per_game_adv"] * HEURISTIC_WEIGHT_RECENT_RUNS_ALLOWED)
+        + (heuristic_frame["rest_days_diff"] * HEURISTIC_WEIGHT_REST_DAYS)
+        + (heuristic_frame["venue_streak_diff"] * HEURISTIC_WEIGHT_VENUE_STREAK)
+        + (heuristic_frame["travel_switch_adv"] * HEURISTIC_WEIGHT_TRAVEL_SWITCH)
+        - (heuristic_frame["doubleheader_flag"] * HEURISTIC_WEIGHT_DOUBLEHEADER)
+        + (heuristic_frame["streak_diff"] * HEURISTIC_WEIGHT_STREAK)
+        + (heuristic_frame["elo_diff"] / HEURISTIC_ELO_DIFF_DIVISOR)
+        + ((heuristic_frame["elo_home_win_prob"] - 0.5) * HEURISTIC_ELO_PROB_CENTER_WEIGHT)
+        + (heuristic_frame["starter_era_adv"] * HEURISTIC_WEIGHT_STARTER_ERA)
+        + (heuristic_frame["starter_whip_adv"] * HEURISTIC_WEIGHT_STARTER_WHIP)
+        + (heuristic_frame["starter_strikeouts_per_9_diff"] * HEURISTIC_WEIGHT_STARTER_K9)
+        + (heuristic_frame["starter_walks_per_9_adv"] * HEURISTIC_WEIGHT_STARTER_BB9)
+        + (heuristic_frame["bullpen_innings_3d_adv"] * HEURISTIC_WEIGHT_BULLPEN_INNINGS)
+        + (heuristic_frame["bullpen_pitches_3d_adv"] / HEURISTIC_BULLPEN_PITCHES_DIVISOR)
+        + (heuristic_frame["relievers_used_3d_adv"] * HEURISTIC_WEIGHT_RELIEVERS_USED)
     )
     benchmark_probabilities.update(
         {
             "home_win_rate_baseline": np.full(len(valid_df), home_win_rate),
-            "always_home": np.full(len(valid_df), 0.999),
+            "always_home": np.full(len(valid_df), 1.0),
             "heuristic_feature_score": 1.0 / (1.0 + np.exp(-heuristic_score.to_numpy())),
         }
     )
@@ -867,6 +944,12 @@ def predict_home_win_probabilities(bundle: dict[str, object], features_df: pd.Da
     _require_feature_columns(features_df)
     results: list[pd.DataFrame] = []
 
+    if bundle.get("bayes_evidence_pipeline") is not None and bundle.get("bayes_base_rate") is not None:
+        scored = features_df.copy()
+        scored["home_win_prob"] = _bayesian_posterior_probabilities(bundle, scored)
+        scored["model_name"] = str(bundle.get("bayes_model_name", BAYES_MODEL_NAME))
+        results.append(scored)
+
     candidate_pipelines: dict[str, object] = bundle.get("candidate_pipelines") or {}
     if candidate_pipelines:
         for model_name, pipeline in candidate_pipelines.items():
@@ -878,12 +961,6 @@ def predict_home_win_probabilities(bundle: dict[str, object], features_df: pd.Da
         scored = features_df.copy()
         scored["home_win_prob"] = bundle["pipeline"].predict_proba(scored[FEATURE_COLUMNS])[:, 1]
         scored["model_name"] = bundle["model_name"]
-        results.append(scored)
-
-    if bundle.get("bayes_evidence_pipeline") is not None and bundle.get("bayes_base_rate") is not None:
-        scored = features_df.copy()
-        scored["home_win_prob"] = _bayesian_posterior_probabilities(bundle, scored)
-        scored["model_name"] = str(bundle.get("bayes_model_name", BAYES_MODEL_NAME))
         results.append(scored)
 
     return pd.concat(results, ignore_index=True)
@@ -931,13 +1008,22 @@ def _bayesian_posterior_probabilities(bundle: dict[str, object], frame: pd.DataF
 
 
 def _bayesian_prior_probabilities(frame: pd.DataFrame, default: float = 0.5) -> np.ndarray:
-    _require_columns(frame, ["market_home_implied_prob"], frame_name="bayesian prior frame")
-    market_prior = np.clip(frame["market_home_implied_prob"].to_numpy(dtype=float), 1e-6, 1 - 1e-6)
-    neutral_mask = np.isclose(market_prior, default, atol=1e-9)
-    if "elo_home_win_prob" not in frame.columns:
-        return market_prior
-    elo_prior = np.clip(frame["elo_home_win_prob"].to_numpy(dtype=float), 1e-6, 1 - 1e-6)
-    return np.where(neutral_mask, elo_prior, market_prior)
+    """Return the prior home-win probability for the Bayesian posterior.
+
+    Prefer the explicit market prior when present so replay / benchmark flows
+    can express a true prior update. When that is unavailable, fall back to
+    the Elo-derived home win probability, then finally to `default`.
+    """
+    if "market_home_implied_prob" in frame.columns:
+        market_prior = frame["market_home_implied_prob"].to_numpy(dtype=float)
+        if np.isfinite(market_prior).any():
+            market_prior = np.where(np.isnan(market_prior), default, market_prior)
+            return np.clip(market_prior, 1e-6, 1 - 1e-6)
+    if "elo_home_win_prob" in frame.columns:
+        elo_prior = frame["elo_home_win_prob"].to_numpy(dtype=float)
+        elo_prior = np.where(np.isnan(elo_prior), default, elo_prior)
+        return np.clip(elo_prior, 1e-6, 1 - 1e-6)
+    return np.full(len(frame), np.clip(default, 1e-6, 1 - 1e-6), dtype=float)
 
 
 def _forward_select_features(
@@ -1168,6 +1254,9 @@ def _split_training_data(training_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Da
 
 
 def _require_feature_columns(frame: pd.DataFrame) -> None:
+    for column, default_value in _WEATHER_FEATURE_DEFAULTS.items():
+        if column not in frame.columns:
+            frame[column] = default_value
     _require_columns(frame, FEATURE_COLUMNS, frame_name="feature frame")
 
 
@@ -1240,6 +1329,7 @@ def _build_game_features(
     market_home_implied_prob: float,
     home_offense_vs_opp_hand: float,
     away_offense_vs_opp_hand: float,
+    weather: dict[str, float] | None = None,
 ) -> dict[str, float]:
     elo_diff = home_snapshot.elo_rating - away_snapshot.elo_rating
     elo_home_win_prob = _elo_win_prob(home_snapshot.elo_rating, away_snapshot.elo_rating)
@@ -1267,14 +1357,29 @@ def _build_game_features(
         "elo_home_win_prob": elo_home_win_prob,
         "market_home_implied_prob": market_home_implied_prob,
         "offense_vs_starter_hand_diff": home_offense_vs_opp_hand - away_offense_vs_opp_hand,
-        "starter_era_adv": _diff_positive_for_home(away_pitching.get("era"), home_pitching.get("era")),
-        "starter_whip_adv": _diff_positive_for_home(away_pitching.get("whip"), home_pitching.get("whip")),
-        "starter_strikeouts_per_9_diff": _float_or_zero(home_pitching.get("strikeouts_per_9")) - _float_or_zero(away_pitching.get("strikeouts_per_9")),
-        "starter_walks_per_9_adv": _diff_positive_for_home(away_pitching.get("walks_per_9"), home_pitching.get("walks_per_9")),
+        "starter_era_adv": _diff_or_nan(away_pitching.get("era"), home_pitching.get("era")),
+        "starter_whip_adv": _diff_or_nan(away_pitching.get("whip"), home_pitching.get("whip")),
+        "starter_strikeouts_per_9_diff": _diff_or_nan(home_pitching.get("strikeouts_per_9"), away_pitching.get("strikeouts_per_9")),
+        "starter_walks_per_9_adv": _diff_or_nan(away_pitching.get("walks_per_9"), home_pitching.get("walks_per_9")),
         "bullpen_innings_3d_adv": _diff_positive_for_home(away_pitching.get("bullpen_innings_3d"), home_pitching.get("bullpen_innings_3d")),
         "bullpen_pitches_3d_adv": _diff_positive_for_home(away_pitching.get("bullpen_pitches_3d"), home_pitching.get("bullpen_pitches_3d")),
         "relievers_used_3d_adv": _diff_positive_for_home(away_pitching.get("relievers_used_3d"), home_pitching.get("relievers_used_3d")),
+        **_weather_features(weather),
     }
+
+
+def _weather_features(weather: dict[str, float] | None) -> dict[str, float]:
+    """Normalize weather lookup output into the FEATURE_COLUMNS weather fields."""
+    if not weather:
+        return dict(_WEATHER_FEATURE_DEFAULTS)
+    out: dict[str, float] = {}
+    for key, default in _WEATHER_FEATURE_DEFAULTS.items():
+        value = weather.get(key)
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            out[key] = default
+        else:
+            out[key] = float(value)
+    return out
 
 
 def _snapshot_team(history: list[dict[str, object]], venue_home: bool, elo_rating: float) -> TeamSnapshot:
@@ -1500,6 +1605,20 @@ def _diff_positive_for_home(away_value: object, home_value: object) -> float:
     return _float_or_zero(away_value) - _float_or_zero(home_value)
 
 
+def _diff_or_nan(minuend: object, subtrahend: object) -> float:
+    """Return minuend - subtrahend, or NaN when either side is missing.
+
+    Used for starter-pitcher stats (ERA/WHIP/K9/BB9) so that missing inputs
+    propagate to NaN and are handled downstream by SimpleImputer(median)
+    instead of being silently coerced to a biased zero.
+    """
+    a = coalesce_float(minuend)
+    b = coalesce_float(subtrahend)
+    if a is None or b is None:
+        return float("nan")
+    return a - b
+
+
 def _offense_vs_hand_before_game(history: list[dict[str, object]], pitcher_hand: object) -> float:
     if not history:
         return OFFENSE_SPLIT_PRIOR
@@ -1524,23 +1643,67 @@ def _market_home_implied_prob(value: object) -> float:
     return clipped
 
 
+def _load_game_weather(start_date: str, end_date: str) -> pd.DataFrame:
+    """Load per-game weather features from the game_weather table."""
+    db_path = settings().duckdb_path
+    weather_cols = [
+        "game_id",
+        "temp_f AS weather_temp_f",
+        "wind_out_to_cf_mph AS weather_wind_out_to_cf_mph",
+        "humidity_pct AS weather_humidity_pct",
+        "precipitation_in AS weather_precipitation_in",
+        "CAST(is_dome_sealed AS DOUBLE) AS weather_is_dome_sealed",
+    ]
+    empty = pd.DataFrame(
+        columns=[
+            "game_id",
+            "weather_temp_f",
+            "weather_wind_out_to_cf_mph",
+            "weather_humidity_pct",
+            "weather_precipitation_in",
+            "weather_is_dome_sealed",
+        ]
+    )
+    if not db_path.exists():
+        return empty
+    conn = connect(db_path)
+    try:
+        try:
+            weather_df = query_dataframe(
+                conn,
+                f"""
+                SELECT {', '.join(weather_cols)}
+                FROM game_weather_deduped
+                WHERE game_date BETWEEN DATE '{start_date}' AND DATE '{end_date}'
+                """,
+            )
+        except Exception:
+            return empty
+    finally:
+        conn.close()
+    return weather_df if weather_df is not None and not weather_df.empty else empty
+
+
 def _load_historical_market_priors(start_date: str, end_date: str) -> pd.DataFrame:
     db_path = settings().duckdb_path
     if not db_path.exists():
         return pd.DataFrame(columns=["game_id", "market_home_implied_prob", "market_source_count"])
 
+    from mlpm.historical.replay import load_kalshi_pregame_replay
+
     conn = connect(db_path)
     try:
-        return query_dataframe(
+        live_priors = query_dataframe(
             conn,
             f"""
+            -- Current-season quotes collected by the live pipeline
             SELECT
                 q.game_id,
                 AVG(CASE WHEN q.outcome_team = g.home_team THEN q.fair_prob END) AS market_home_implied_prob,
                 COUNT(DISTINCT q.source) AS market_source_count
             FROM normalized_quotes_deduped q
             JOIN games_deduped g ON g.game_id = q.game_id
-            WHERE g.game_date BETWEEN DATE '{start_date}' AND DATE '{end_date}'
+            WHERE CAST(g.game_date AS DATE) BETWEEN DATE '{start_date}' AND DATE '{end_date}'
               AND q.is_valid = TRUE
               AND q.is_pregame = TRUE
             GROUP BY q.game_id
@@ -1549,3 +1712,24 @@ def _load_historical_market_priors(start_date: str, end_date: str) -> pd.DataFra
         )
     finally:
         conn.close()
+
+    replay_priors = load_kalshi_pregame_replay(start_date, end_date)
+    if replay_priors.empty:
+        return live_priors
+
+    replay_priors = replay_priors[["game_id", "home_market_prob"]].rename(
+        columns={"home_market_prob": "market_home_implied_prob"}
+    )
+    replay_priors["market_source_count"] = 1
+
+    if live_priors.empty:
+        return replay_priors
+
+    combined = pd.concat(
+        [
+            live_priors,
+            replay_priors[~replay_priors["game_id"].isin(live_priors["game_id"])],
+        ],
+        ignore_index=True,
+    )
+    return combined

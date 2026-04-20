@@ -202,6 +202,86 @@ CREATE TABLE IF NOT EXISTS game_results (
     home_score INTEGER
 );
 
+-- Persisted MLB Stats API pitching logs (boxscore-derived).
+-- Backfilled once via scripts/backfill_mlb_history; training reads from here.
+CREATE TABLE IF NOT EXISTS mlb_pitching_logs (
+    game_id VARCHAR,
+    game_date DATE,
+    team VARCHAR,
+    side VARCHAR,
+    starting_pitcher_id BIGINT,
+    starting_pitcher_name VARCHAR,
+    starting_pitcher_hand VARCHAR,
+    starter_innings_pitched DOUBLE,
+    starter_earned_runs INTEGER,
+    starter_hits INTEGER,
+    starter_walks INTEGER,
+    starter_strikeouts INTEGER,
+    bullpen_innings DOUBLE,
+    bullpen_pitches INTEGER,
+    relievers_used INTEGER,
+    imported_at TIMESTAMP
+);
+
+-- Persisted MLB Stats API team batting logs.
+CREATE TABLE IF NOT EXISTS mlb_batting_logs (
+    game_id VARCHAR,
+    game_date DATE,
+    team VARCHAR,
+    opponent_team VARCHAR,
+    at_bats INTEGER,
+    hits INTEGER,
+    walks INTEGER,
+    strikeouts INTEGER,
+    doubles INTEGER,
+    triples INTEGER,
+    home_runs INTEGER,
+    runs_scored INTEGER,
+    imported_at TIMESTAMP
+);
+
+-- Source-agnostic pre-game market probabilities (SBRO, Kalshi replay, Pinnacle close, etc.).
+-- Used by the walk-forward backtest to grade model predictions against the market.
+CREATE TABLE IF NOT EXISTS historical_market_priors (
+    game_id VARCHAR,
+    game_date DATE,
+    source VARCHAR,              -- 'sbro', 'kalshi_replay', 'pinnacle', etc.
+    home_team VARCHAR,
+    away_team VARCHAR,
+    home_moneyline_close INTEGER, -- American odds, nullable (only set for sportsbook sources)
+    away_moneyline_close INTEGER,
+    home_implied_prob_raw DOUBLE, -- With vig
+    away_implied_prob_raw DOUBLE,
+    home_fair_prob DOUBLE,       -- De-vigged
+    away_fair_prob DOUBLE,
+    book VARCHAR,                -- Which sportsbook the close came from (for SBRO: 'consensus')
+    imported_at TIMESTAMP
+);
+
+-- Walk-forward backtest bet log. One row per flagged bet.
+CREATE TABLE IF NOT EXISTS walkforward_bets (
+    run_id VARCHAR,              -- Unique per backtest invocation
+    model_name VARCHAR,
+    game_id VARCHAR,
+    game_date DATE,
+    home_team VARCHAR,
+    away_team VARCHAR,
+    picked_team VARCHAR,
+    is_home_pick BOOLEAN,
+    model_prob DOUBLE,           -- Model's probability for the picked side
+    market_prob DOUBLE,          -- Market fair prob for the picked side
+    edge_pct DOUBLE,             -- model_prob - market_prob (positive = model sees value)
+    decimal_odds DOUBLE,         -- 1 / market_prob
+    stake DOUBLE,                -- Units staked (1 for flat-stake)
+    won_bet BOOLEAN,
+    payout DOUBLE,               -- Net profit on the bet (negative if lost)
+    winner_team VARCHAR,
+    train_rows INTEGER,
+    train_start_date DATE,
+    train_end_date DATE,
+    scored_at TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS collector_runs (
     run_id VARCHAR,
     started_at TIMESTAMP,
@@ -238,6 +318,25 @@ CREATE TABLE IF NOT EXISTS champion_history (
     incumbent_bets INTEGER,
     incumbent_roi DOUBLE,
     incumbent_win_rate DOUBLE
+);
+
+-- Per-game weather pulled from Open-Meteo's Historical Weather API. Populated
+-- by `mlpm backfill-weather` and consumed by the training / backtest pipeline.
+CREATE TABLE IF NOT EXISTS game_weather (
+    game_id VARCHAR,
+    game_date DATE,
+    venue_team VARCHAR,
+    az_cf_deg DOUBLE,
+    roof_type VARCHAR,
+    temp_f DOUBLE,
+    wind_mph DOUBLE,
+    wind_dir_deg DOUBLE,
+    wind_out_to_cf_mph DOUBLE,
+    wind_crossfield_mph DOUBLE,
+    humidity_pct DOUBLE,
+    precipitation_in DOUBLE,
+    is_dome_sealed INTEGER,
+    imported_at TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS feature_importances (
@@ -445,6 +544,62 @@ WITH ranked AS (
             ORDER BY game_date DESC
         ) AS rn
     FROM game_results
+)
+SELECT * EXCLUDE (rn)
+FROM ranked
+WHERE rn = 1;
+
+CREATE OR REPLACE VIEW mlb_pitching_logs_deduped AS
+WITH ranked AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY game_id, team
+            ORDER BY imported_at DESC
+        ) AS rn
+    FROM mlb_pitching_logs
+)
+SELECT * EXCLUDE (rn)
+FROM ranked
+WHERE rn = 1;
+
+CREATE OR REPLACE VIEW mlb_batting_logs_deduped AS
+WITH ranked AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY game_id, team
+            ORDER BY imported_at DESC
+        ) AS rn
+    FROM mlb_batting_logs
+)
+SELECT * EXCLUDE (rn)
+FROM ranked
+WHERE rn = 1;
+
+CREATE OR REPLACE VIEW game_weather_deduped AS
+WITH ranked AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY game_id
+            ORDER BY imported_at DESC
+        ) AS rn
+    FROM game_weather
+)
+SELECT * EXCLUDE (rn)
+FROM ranked
+WHERE rn = 1;
+
+CREATE OR REPLACE VIEW historical_market_priors_deduped AS
+WITH ranked AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY game_id, source
+            ORDER BY imported_at DESC
+        ) AS rn
+    FROM historical_market_priors
 )
 SELECT * EXCLUDE (rn)
 FROM ranked

@@ -15,6 +15,9 @@ from mlpm.historical.kalshi_backfill import (
     _market_query_window,
     _should_use_historical_market,
     _write_historical_kalshi_rows,
+    build_kalshi_market_candidates,
+    build_kalshi_ticker_candidates,
+    split_kalshi_ticker_prediction_games,
 )
 from mlpm.historical.normalize_kalshi_history import normalize_kalshi_candle_payload
 from mlpm.historical.normalize_polymarket_history import polymarket_history_to_quote_rows
@@ -166,6 +169,141 @@ def test_market_query_window_stops_at_first_pitch_not_close() -> None:
 
     assert start_ts == int(pd.Timestamp("2026-03-31T17:10:00Z").timestamp())
     assert end_ts == int(pd.Timestamp("2026-04-01T17:10:00Z").timestamp())
+
+
+def test_split_kalshi_ticker_prediction_games_only_predicts_2025_forward() -> None:
+    games = pd.DataFrame(
+        [
+            {
+                "game_id": "g-2024",
+                "game_date": "2024-09-01",
+                "event_start_time": "2024-09-01T18:00:00Z",
+                "away_team": "Chicago Cubs",
+                "home_team": "St. Louis Cardinals",
+            },
+            {
+                "game_id": "g-2025",
+                "game_date": "2025-04-01",
+                "event_start_time": "2025-04-01T18:00:00Z",
+                "away_team": "Chicago Cubs",
+                "home_team": "St. Louis Cardinals",
+            },
+        ]
+    )
+
+    predictable_games, discovery_games = split_kalshi_ticker_prediction_games(games)
+
+    assert predictable_games["game_id"].tolist() == ["g-2025"]
+    assert discovery_games["game_id"].tolist() == ["g-2024"]
+
+
+def test_build_kalshi_ticker_candidates_skips_pre_2025_games() -> None:
+    games = pd.DataFrame(
+        [
+            {
+                "game_id": "g-2024",
+                "game_date": "2024-09-01",
+                "event_start_time": "2024-09-01T18:00:00Z",
+                "away_team": "Chicago Cubs",
+                "home_team": "St. Louis Cardinals",
+            },
+            {
+                "game_id": "g-2025",
+                "game_date": "2025-04-01",
+                "event_start_time": "2025-04-01T18:00:00Z",
+                "away_team": "Chicago Cubs",
+                "home_team": "St. Louis Cardinals",
+            },
+        ]
+    )
+
+    candidates = build_kalshi_ticker_candidates(games)
+
+    assert sorted(candidates["game_id"].unique().tolist()) == ["g-2025"]
+
+
+def test_build_kalshi_market_candidates_uses_discovery_for_pre_2025(monkeypatch) -> None:
+    games = pd.DataFrame(
+        [
+            {
+                "game_id": "g-2024",
+                "game_date": "2024-09-01",
+                "event_start_time": "2024-09-01T18:00:00Z",
+                "away_team": "Chicago Cubs",
+                "home_team": "St. Louis Cardinals",
+            },
+            {
+                "game_id": "g-2025",
+                "game_date": "2025-04-01",
+                "event_start_time": "2025-04-01T18:00:00Z",
+                "away_team": "Chicago Cubs",
+                "home_team": "St. Louis Cardinals",
+            },
+        ]
+    )
+
+    monkeypatch.setattr(
+        "mlpm.historical.kalshi_backfill.discover_kalshi_markets_for_games",
+        lambda games_df, historical_cutoff=None: pd.DataFrame(
+            [
+                {
+                    "event_id": "evt-2024",
+                    "market_id": "m-2024",
+                    "ticker": "t-2024",
+                    "game_id": games_df.iloc[0]["game_id"],
+                    "event_start_time": games_df.iloc[0]["event_start_time"],
+                    "home_team": games_df.iloc[0]["home_team"],
+                    "away_team": games_df.iloc[0]["away_team"],
+                    "outcome_team": games_df.iloc[0]["home_team"],
+                    "day_key": games_df.iloc[0]["game_date"],
+                }
+            ]
+        ),
+    )
+
+    candidates = build_kalshi_market_candidates(games, historical_cutoff={"market_settled_ts": "2026-01-01T00:00:00Z"})
+
+    assert sorted(candidates["game_id"].unique().tolist()) == ["g-2024", "g-2025"]
+
+
+def test_build_kalshi_market_candidates_prefers_discovery_for_2025_when_available(monkeypatch) -> None:
+    games = pd.DataFrame(
+        [
+            {
+                "game_id": "g-2025",
+                "game_date": "2025-04-01",
+                "event_start_time": "2025-04-01T18:00:00Z",
+                "away_team": "Chicago Cubs",
+                "home_team": "St. Louis Cardinals",
+            },
+        ]
+    )
+
+    monkeypatch.setattr(
+        "mlpm.historical.kalshi_backfill.discover_kalshi_markets_for_games",
+        lambda games_df, historical_cutoff=None: pd.DataFrame(
+            [
+                {
+                    "event_id": "evt-2025",
+                    "market_id": "m-2025-real",
+                    "ticker": "t-2025-real",
+                    "game_id": games_df.iloc[0]["game_id"],
+                    "event_start_time": games_df.iloc[0]["event_start_time"],
+                    "home_team": games_df.iloc[0]["home_team"],
+                    "away_team": games_df.iloc[0]["away_team"],
+                    "outcome_team": games_df.iloc[0]["home_team"],
+                    "day_key": games_df.iloc[0]["game_date"],
+                }
+            ]
+        ),
+    )
+
+    candidates = build_kalshi_market_candidates(
+        games,
+        historical_cutoff={"market_settled_ts": "2026-01-01T00:00:00Z"},
+    )
+
+    assert candidates["ticker"].tolist() == ["t-2025-real"]
 
 
 def test_scheduled_first_pitch_utc_normalizes_game_date() -> None:

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
+from pathlib import Path
+import uuid
 
+from mlpm.backtest.walkforward import run_walkforward_backtest
 from mlpm.models.game_outcome import run_historical_kalshi_backtest
+from mlpm.storage.duckdb import connect_read_only
 
 
 def test_run_historical_kalshi_backtest_reports_roi(monkeypatch) -> None:
@@ -106,3 +111,343 @@ def test_run_historical_kalshi_backtest_reports_roi(monkeypatch) -> None:
     assert result["eval_start_date"] == "2026-04-05"
     assert "mlb_win_bayes_v1" in result["benchmarks"]
     assert "roi" in result["benchmarks"]["mlb_win_bayes_v1"]
+
+
+def test_run_walkforward_backtest_clears_prior_rows_for_same_run_id(monkeypatch) -> None:
+    tmp_dir = Path(".tmp") / f"walkforward-{uuid.uuid4().hex}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    db_path = tmp_dir / "walkforward.duckdb"
+    feature_df = pd.DataFrame(
+        [
+            {
+                "game_id": "train-1",
+                "game_date": pd.Timestamp("2026-03-15").date(),
+                "home_team": "Home A",
+                "away_team": "Away A",
+                "target_home_win": 1,
+                "season_win_pct_diff": 0.1,
+                "recent_win_pct_diff": 0.1,
+                "venue_win_pct_diff": 0.1,
+                "run_diff_per_game_diff": 0.1,
+                "season_runs_scored_per_game_diff": 0.1,
+                "season_runs_allowed_per_game_adv": 0.1,
+                "recent_runs_scored_per_game_diff": 0.1,
+                "recent_runs_allowed_per_game_adv": 0.1,
+                "rest_days_diff": 0.1,
+                "venue_streak_diff": 0.1,
+                "travel_switch_adv": 0.0,
+                "doubleheader_flag": 0.0,
+                "streak_diff": 0.1,
+                "elo_diff": 10.0,
+                "elo_home_win_prob": 0.55,
+                "offense_vs_starter_hand_diff": 0.1,
+                "starter_era_adv": 0.1,
+                "starter_whip_adv": 0.1,
+                "starter_strikeouts_per_9_diff": 0.1,
+                "starter_walks_per_9_adv": 0.1,
+                "bullpen_innings_3d_adv": 0.1,
+                "bullpen_pitches_3d_adv": 1.0,
+                "relievers_used_3d_adv": 0.1,
+                "weather_temp_f": 72.0,
+                "weather_wind_out_to_cf_mph": 0.0,
+                "weather_humidity_pct": 50.0,
+                "weather_precipitation_in": 0.0,
+                "weather_is_dome_sealed": 0.0,
+            },
+            {
+                "game_id": "train-2",
+                "game_date": pd.Timestamp("2026-03-20").date(),
+                "home_team": "Home C",
+                "away_team": "Away C",
+                "target_home_win": 0,
+                "season_win_pct_diff": -0.1,
+                "recent_win_pct_diff": -0.1,
+                "venue_win_pct_diff": -0.1,
+                "run_diff_per_game_diff": -0.1,
+                "season_runs_scored_per_game_diff": -0.1,
+                "season_runs_allowed_per_game_adv": -0.1,
+                "recent_runs_scored_per_game_diff": -0.1,
+                "recent_runs_allowed_per_game_adv": -0.1,
+                "rest_days_diff": -0.1,
+                "venue_streak_diff": -0.1,
+                "travel_switch_adv": 0.0,
+                "doubleheader_flag": 0.0,
+                "streak_diff": -0.1,
+                "elo_diff": -10.0,
+                "elo_home_win_prob": 0.45,
+                "offense_vs_starter_hand_diff": -0.1,
+                "starter_era_adv": -0.1,
+                "starter_whip_adv": -0.1,
+                "starter_strikeouts_per_9_diff": -0.1,
+                "starter_walks_per_9_adv": -0.1,
+                "bullpen_innings_3d_adv": -0.1,
+                "bullpen_pitches_3d_adv": -1.0,
+                "relievers_used_3d_adv": -0.1,
+                "weather_temp_f": 72.0,
+                "weather_wind_out_to_cf_mph": 0.0,
+                "weather_humidity_pct": 50.0,
+                "weather_precipitation_in": 0.0,
+                "weather_is_dome_sealed": 0.0,
+            },
+            {
+                "game_id": "eval-1",
+                "game_date": pd.Timestamp("2026-04-02").date(),
+                "home_team": "Home B",
+                "away_team": "Away B",
+                "target_home_win": 1,
+                "season_win_pct_diff": 0.2,
+                "recent_win_pct_diff": 0.2,
+                "venue_win_pct_diff": 0.2,
+                "run_diff_per_game_diff": 0.2,
+                "season_runs_scored_per_game_diff": 0.2,
+                "season_runs_allowed_per_game_adv": 0.2,
+                "recent_runs_scored_per_game_diff": 0.2,
+                "recent_runs_allowed_per_game_adv": 0.2,
+                "rest_days_diff": 0.2,
+                "venue_streak_diff": 0.2,
+                "travel_switch_adv": 0.0,
+                "doubleheader_flag": 0.0,
+                "streak_diff": 0.2,
+                "elo_diff": 20.0,
+                "elo_home_win_prob": 0.60,
+                "offense_vs_starter_hand_diff": 0.2,
+                "starter_era_adv": 0.2,
+                "starter_whip_adv": 0.2,
+                "starter_strikeouts_per_9_diff": 0.2,
+                "starter_walks_per_9_adv": 0.2,
+                "bullpen_innings_3d_adv": 0.2,
+                "bullpen_pitches_3d_adv": 2.0,
+                "relievers_used_3d_adv": 0.2,
+                "weather_temp_f": 72.0,
+                "weather_wind_out_to_cf_mph": 0.0,
+                "weather_humidity_pct": 50.0,
+                "weather_precipitation_in": 0.0,
+                "weather_is_dome_sealed": 0.0,
+            },
+        ]
+    )
+    priors_df = pd.DataFrame(
+        [
+            {
+                "game_id": "eval-1",
+                "game_date": pd.Timestamp("2026-04-02").date(),
+                "home_team": "Home B",
+                "away_team": "Away B",
+                "home_fair_prob": 0.50,
+                "away_fair_prob": 0.50,
+                "home_moneyline_close": -110,
+                "away_moneyline_close": 100,
+                "book": "consensus_close",
+            }
+        ]
+    )
+
+    class DummyPipeline:
+        def __init__(self, probability: float) -> None:
+            self.probability = probability
+
+        def predict_proba(self, frame):
+            return np.asarray([[1.0 - self.probability, self.probability] for _ in range(len(frame))], dtype=float)
+
+    monkeypatch.setattr("mlpm.backtest.walkforward._load_feature_frame", lambda *_args, **_kwargs: feature_df)
+    monkeypatch.setattr("mlpm.backtest.walkforward._load_sbro_priors", lambda *_args, **_kwargs: priors_df)
+    monkeypatch.setattr("mlpm.backtest.walkforward._fit_model", lambda *_args, **_kwargs: DummyPipeline(0.70))
+
+    first = run_walkforward_backtest(
+        "2026-04-01",
+        "2026-04-30",
+        model_name="logreg",
+        min_train_rows=1,
+        db_path=db_path,
+        run_id="wf-test",
+    )
+    assert first["total_bets"] == 1
+
+    monkeypatch.setattr("mlpm.backtest.walkforward._fit_model", lambda *_args, **_kwargs: DummyPipeline(0.51))
+    second = run_walkforward_backtest(
+        "2026-04-01",
+        "2026-04-30",
+        model_name="logreg",
+        min_train_rows=1,
+        db_path=db_path,
+        run_id="wf-test",
+    )
+    assert second["total_bets"] == 0
+
+    conn = connect_read_only(db_path)
+    try:
+        remaining = conn.execute("SELECT COUNT(*) FROM walkforward_bets WHERE run_id = 'wf-test'").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert remaining == 0
+
+
+def test_run_walkforward_backtest_all_models_persists_distinct_model_rows(monkeypatch) -> None:
+    tmp_dir = Path(".tmp") / f"walkforward-all-{uuid.uuid4().hex}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    db_path = tmp_dir / "walkforward.duckdb"
+    feature_df = pd.DataFrame(
+        [
+            {
+                "game_id": "train-1",
+                "game_date": pd.Timestamp("2026-03-15").date(),
+                "home_team": "Home A",
+                "away_team": "Away A",
+                "target_home_win": 1,
+                "season_win_pct_diff": 0.1,
+                "recent_win_pct_diff": 0.1,
+                "venue_win_pct_diff": 0.1,
+                "run_diff_per_game_diff": 0.1,
+                "season_runs_scored_per_game_diff": 0.1,
+                "season_runs_allowed_per_game_adv": 0.1,
+                "recent_runs_scored_per_game_diff": 0.1,
+                "recent_runs_allowed_per_game_adv": 0.1,
+                "rest_days_diff": 0.1,
+                "venue_streak_diff": 0.1,
+                "travel_switch_adv": 0.0,
+                "doubleheader_flag": 0.0,
+                "streak_diff": 0.1,
+                "elo_diff": 10.0,
+                "elo_home_win_prob": 0.55,
+                "offense_vs_starter_hand_diff": 0.1,
+                "starter_era_adv": 0.1,
+                "starter_whip_adv": 0.1,
+                "starter_strikeouts_per_9_diff": 0.1,
+                "starter_walks_per_9_adv": 0.1,
+                "bullpen_innings_3d_adv": 0.1,
+                "bullpen_pitches_3d_adv": 1.0,
+                "relievers_used_3d_adv": 0.1,
+                "weather_temp_f": 72.0,
+                "weather_wind_out_to_cf_mph": 0.0,
+                "weather_humidity_pct": 50.0,
+                "weather_precipitation_in": 0.0,
+                "weather_is_dome_sealed": 0.0,
+            },
+            {
+                "game_id": "train-2",
+                "game_date": pd.Timestamp("2026-03-20").date(),
+                "home_team": "Home C",
+                "away_team": "Away C",
+                "target_home_win": 0,
+                "season_win_pct_diff": -0.1,
+                "recent_win_pct_diff": -0.1,
+                "venue_win_pct_diff": -0.1,
+                "run_diff_per_game_diff": -0.1,
+                "season_runs_scored_per_game_diff": -0.1,
+                "season_runs_allowed_per_game_adv": -0.1,
+                "recent_runs_scored_per_game_diff": -0.1,
+                "recent_runs_allowed_per_game_adv": -0.1,
+                "rest_days_diff": -0.1,
+                "venue_streak_diff": -0.1,
+                "travel_switch_adv": 0.0,
+                "doubleheader_flag": 0.0,
+                "streak_diff": -0.1,
+                "elo_diff": -10.0,
+                "elo_home_win_prob": 0.45,
+                "offense_vs_starter_hand_diff": -0.1,
+                "starter_era_adv": -0.1,
+                "starter_whip_adv": -0.1,
+                "starter_strikeouts_per_9_diff": -0.1,
+                "starter_walks_per_9_adv": -0.1,
+                "bullpen_innings_3d_adv": -0.1,
+                "bullpen_pitches_3d_adv": -1.0,
+                "relievers_used_3d_adv": -0.1,
+                "weather_temp_f": 72.0,
+                "weather_wind_out_to_cf_mph": 0.0,
+                "weather_humidity_pct": 50.0,
+                "weather_precipitation_in": 0.0,
+                "weather_is_dome_sealed": 0.0,
+            },
+            {
+                "game_id": "eval-1",
+                "game_date": pd.Timestamp("2026-04-02").date(),
+                "home_team": "Home B",
+                "away_team": "Away B",
+                "target_home_win": 1,
+                "season_win_pct_diff": 0.2,
+                "recent_win_pct_diff": 0.2,
+                "venue_win_pct_diff": 0.2,
+                "run_diff_per_game_diff": 0.2,
+                "season_runs_scored_per_game_diff": 0.2,
+                "season_runs_allowed_per_game_adv": 0.2,
+                "recent_runs_scored_per_game_diff": 0.2,
+                "recent_runs_allowed_per_game_adv": 0.2,
+                "rest_days_diff": 0.2,
+                "venue_streak_diff": 0.2,
+                "travel_switch_adv": 0.0,
+                "doubleheader_flag": 0.0,
+                "streak_diff": 0.2,
+                "elo_diff": 20.0,
+                "elo_home_win_prob": 0.60,
+                "offense_vs_starter_hand_diff": 0.2,
+                "starter_era_adv": 0.2,
+                "starter_whip_adv": 0.2,
+                "starter_strikeouts_per_9_diff": 0.2,
+                "starter_walks_per_9_adv": 0.2,
+                "bullpen_innings_3d_adv": 0.2,
+                "bullpen_pitches_3d_adv": 2.0,
+                "relievers_used_3d_adv": 0.2,
+                "weather_temp_f": 72.0,
+                "weather_wind_out_to_cf_mph": 0.0,
+                "weather_humidity_pct": 50.0,
+                "weather_precipitation_in": 0.0,
+                "weather_is_dome_sealed": 0.0,
+            },
+        ]
+    )
+    priors_df = pd.DataFrame(
+        [
+            {
+                "game_id": "eval-1",
+                "game_date": pd.Timestamp("2026-04-02").date(),
+                "home_team": "Home B",
+                "away_team": "Away B",
+                "home_fair_prob": 0.50,
+                "away_fair_prob": 0.50,
+                "home_moneyline_close": -110,
+                "away_moneyline_close": 100,
+                "book": "consensus_close",
+            }
+        ]
+    )
+
+    class DummyPipeline:
+        def __init__(self, probability: float) -> None:
+            self.probability = probability
+
+        def predict_proba(self, frame):
+            return np.asarray([[1.0 - self.probability, self.probability] for _ in range(len(frame))], dtype=float)
+
+    model_probabilities = {"logreg": 0.70, "histgb": 0.68, "knn": 0.66, "svm": 0.64}
+
+    monkeypatch.setattr("mlpm.backtest.walkforward._load_feature_frame", lambda *_args, **_kwargs: feature_df)
+    monkeypatch.setattr("mlpm.backtest.walkforward._load_sbro_priors", lambda *_args, **_kwargs: priors_df)
+    monkeypatch.setattr(
+        "mlpm.backtest.walkforward._fit_model",
+        lambda _train_df, current_model_name: DummyPipeline(model_probabilities[current_model_name]),
+    )
+
+    result = run_walkforward_backtest(
+        "2026-04-01",
+        "2026-04-30",
+        model_name="all",
+        min_train_rows=1,
+        db_path=db_path,
+        run_id="wf-all",
+    )
+
+    assert result["model_names"] == ["logreg", "histgb", "knn", "svm"]
+    assert result["total_bets"] == 4
+    assert set(result["models"]) == {"logreg", "histgb", "knn", "svm"}
+    assert all(metrics["total_bets"] == 1 for metrics in result["models"].values())
+
+    conn = connect_read_only(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT model_name, COUNT(*) AS bets FROM walkforward_bets WHERE run_id = 'wf-all' GROUP BY model_name ORDER BY model_name"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert rows == [("histgb", 1), ("knn", 1), ("logreg", 1), ("svm", 1)]

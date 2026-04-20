@@ -31,6 +31,11 @@ mlpm report-settled-windows              # Rolling performance windows
 mlpm report-strategy-performance         # Grade betting ROI
 mlpm sync-results                        # Backfill final MLB game results
 mlpm historical-backtest-kalshi          # Replay-based historical backtest
+
+# Multi-year backfill + retrain (run once to build full training dataset)
+./scripts/backfill_history.sh            # Backfill 2023-2025 Kalshi data, then retrain
+./scripts/backfill_history.sh --train-only  # Skip backfill, just retrain on existing data
+mlpm train-game-model --start-date 2023-03-01  # Train directly on multi-year range
 ```
 
 ## Architecture
@@ -72,6 +77,21 @@ MLPM is a local research pipeline that finds fair-value discrepancies between an
 - **MLflow runs** in `mlruns/` — experiment tracking
 
 Key DuckDB views: `*_deduped` (latest snapshot per game), `settled_predictions_deduped` (outcomes + predictions joined), `strategy_performance_daily` (daily ROI).
+
+### Historical Data & Multi-Year Training
+
+The backfill pipeline stores data in `historical_kalshi_quotes`. `train-game-model` automatically uses this table via `_load_historical_market_priors`, which unions:
+1. `normalized_quotes_deduped` — live quotes from the current season pipeline
+2. `historical_kalshi_quotes` — backfilled candle data from prior seasons
+
+This means you can train on multiple years by:
+1. Running `./scripts/backfill_history.sh` once (or manually per season)
+2. Running `mlpm train-game-model --start-date 2023-03-01`
+
+The backfill is resumable — re-running it safely skips already-imported chunks. The backfill uses direct ticker construction (faster than API discovery) with graceful 404 handling for games without Kalshi markets. Kalshi game market data is available from approximately the 2023 season onward.
+
+Ticker format: `KXMLBGAME-{YY}{MON}{DD}{HH}{MM}{AWAY_CODE}{HOME_CODE}-{SIDE_CODE}`
+Example: `KXMLBGAME-26APR011215ATHATL-ATH`
 
 ### Configuration
 
