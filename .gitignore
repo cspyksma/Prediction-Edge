@@ -1,5 +1,6 @@
 .venv/
 __pycache__/
+**/__pycache__/
 .pytest_cache/
 pytest-cache-files-*/
 .playwright-mcp/
@@ -8,6 +9,10 @@ pytest-cache-files-*/
 htmlcov/
 dist/
 build/
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+frontend/*.timestamp-*.mjs
 .tmp/
 *.egg-info/
 *.pyc
@@ -18,6 +23,8 @@ mlruns/
 artifacts/
 data/raw/*
 data/processed/*
+data/dashboard_jobs/*.json
+data/dashboard_jobs/*.log
 data/*.duckdb
 data/*.duckdb*
 sbro/*.xlsx

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -17,8 +18,12 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
 from mlpm.config.settings import settings
-from mlpm.evaluation.strategy import build_bet_opportunities
-from mlpm.historical.replay import build_kalshi_replay_quote_rows, load_kalshi_pregame_replay
+from mlpm.evaluation.strategy import bootstrap_roi_ci, build_bet_opportunities
+from mlpm.historical.replay import (
+    SUPPORTED_SNAPSHOT_POLICIES,
+    build_kalshi_replay_quote_rows,
+    load_kalshi_pregame_replay,
+)
 from mlpm.models.game_outcome import (
     BAYES_EVIDENCE_FEATURE_COLUMNS,
     BAYES_MODEL_NAME,
@@ -31,18 +36,28 @@ from mlpm.models.game_outcome import (
     _bayesian_posterior_probabilities,
     build_training_dataset,
 )
+
+# ``MLPHomeWinClassifier`` (PyTorch) is imported lazily inside the ``mlp``
+# branch of ``_build_pipeline`` so torch is only required when someone asks
+# for an MLP contender. Keeps non-model CLI commands usable without torch.
 from mlpm.storage.duckdb import connect, connect_read_only, query_dataframe
 
+logger = logging.getLogger(__name__)
 
 MARKET_FEATURE_COLUMN = "market_home_implied_prob"
 BASEBALL_FEATURE_COLUMNS = list(FEATURE_COLUMNS)
 MARKET_AWARE_FEATURE_COLUMNS = [*FEATURE_COLUMNS, MARKET_FEATURE_COLUMN]
 MARKET_ONLY_FEATURE_COLUMNS = [MARKET_FEATURE_COLUMN]
 
+DEFAULT_SNAPSHOT_POLICY = "t_minus_30m"
 DEFAULT_EDGE_THRESHOLDS_BPS = (0, 100, 300)
 DEFAULT_MIN_BETS = 20
 DEFAULT_MIN_ACTIVE_SLICES = 3
 DEFAULT_MAX_SLICE_BET_SHARE = 0.60
+DEFAULT_MIN_POSITIVE_SLICE_RATE = 0.40
+DEFAULT_MIN_ROI_CI_LOWER = 0.0
+DEFAULT_SLIPPAGE_BPS = 25
+DEFAULT_PARTIAL_FILL_RATE = 0.90
 
 
 @dataclass(frozen=True)
@@ -150,12 +165,51 @@ def _build_pipeline(model_kind: str, feature_columns: list[str]) -> Pipeline:
                 ("classifier", SVC(kernel="rbf", C=1.0, gamma="scale", probability=True, random_state=42)),
             ]
         )
+    if model_kind == "mlp":
+        from mlpm.models.mlp import MLPHomeWinClassifier  # lazy: torch only loaded on demand
+
+        return Pipeline(
+            steps=[
+                (
+                    "preprocess",
+                    ColumnTransformer(
+                        transformers=[
+                            (
+                                "numeric",
+                                Pipeline(
+                                    steps=[
+                                        ("impute", SimpleImputer(strategy="median")),
+                                        ("scale", StandardScaler()),
+                                    ]
+                                ),
+                                feature_columns,
+                            )
+                        ]
+                    ),
+                ),
+                (
+                    "classifier",
+                    MLPHomeWinClassifier(
+                        hidden_layers=(128, 64, 32),
+                        dropout=0.25,
+                        learning_rate=1e-3,
+                        weight_decay=1e-4,
+                        batch_size=256,
+                        max_epochs=200,
+                        patience=15,
+                        validation_fraction=0.1,
+                        random_state=42,
+                        use_batch_norm=True,
+                    ),
+                ),
+            ]
+        )
     raise ValueError(f"Unsupported model_kind={model_kind}")
 
 
 def _build_research_contenders() -> list[ContenderSpec]:
     specs: list[ContenderSpec] = []
-    for model_family in ("logreg", "histgb", "knn", "svm"):
+    for model_family in ("logreg", "histgb", "knn", "svm", "mlp"):
         specs.append(
             ContenderSpec(
                 name=f"baseball_{model_family}_v1",
@@ -322,6 +376,8 @@ def _load_research_frames(
     train_end_date: str,
     eval_start_date: str,
     eval_end_date: str,
+    *,
+    snapshot_policy: str,
 ) -> dict[str, pd.DataFrame]:
     combined_results_df = _load_local_results_frame(train_start_date, eval_end_date)
     if combined_results_df.empty:
@@ -336,7 +392,12 @@ def _load_research_frames(
     eval_results_df = combined_results_df[
         pd.to_datetime(combined_results_df["game_date"]).between(pd.Timestamp(eval_start_date), pd.Timestamp(eval_end_date))
     ].copy()
-    eval_replay_df = load_kalshi_pregame_replay(eval_start_date, eval_end_date, games_df=eval_results_df)
+    eval_replay_df = load_kalshi_pregame_replay(
+        eval_start_date,
+        eval_end_date,
+        games_df=eval_results_df,
+        snapshot_policy=snapshot_policy,
+    )
 
     pitching_logs_df = _load_local_pitching_logs(train_start_date, eval_end_date)
     batting_logs_df = _load_local_batting_logs(train_start_date, eval_end_date)
@@ -381,6 +442,12 @@ def _fit_and_score_contenders(train_df: pd.DataFrame, valid_df: pd.DataFrame) ->
     bayes_bundle = _train_bayesian_bundle(train_df)
 
     for spec in contender_specs:
+        logger.info(
+            "Fitting contender %s family=%s feature_variant=%s",
+            spec.name,
+            spec.family,
+            spec.feature_variant,
+        )
         if spec.builder_kind == "identity":
             probabilities = np.clip(valid_df[MARKET_FEATURE_COLUMN].to_numpy(dtype=float), 1e-6, 1 - 1e-6)
         elif spec.builder_kind == "bayes":
@@ -433,6 +500,11 @@ def _fit_and_score_contenders(train_df: pd.DataFrame, valid_df: pd.DataFrame) ->
     return probabilities_by_contender, contender_rows, calibration_rows
 
 
+def _effective_market_probabilities(market_probabilities: pd.Series, *, slippage_bps: int) -> pd.Series:
+    adjusted = market_probabilities.astype(float) + (slippage_bps / 10_000.0)
+    return adjusted.clip(lower=1e-6, upper=1 - 1e-6)
+
+
 def _stake_units(sizing_policy: str, *, model_prob: float, implied_decimal_odds: float, edge_bps: int) -> float:
     if sizing_policy == "flat_1u":
         return 1.0
@@ -477,6 +549,21 @@ def _slice_metrics(frame: pd.DataFrame) -> list[dict[str, Any]]:
     return rows
 
 
+def _roi_confidence_interval(frame: pd.DataFrame) -> tuple[float, float, float]:
+    if frame.empty:
+        return (0.0, 0.0, 0.0)
+    cfg = settings()
+    returns = frame["realized_return_units"].to_numpy(dtype=float)
+    stakes = frame["stake_units"].to_numpy(dtype=float)
+    return bootstrap_roi_ci(
+        returns,
+        stakes,
+        confidence=cfg.strategy_champion_ci_confidence,
+        n_samples=cfg.strategy_champion_bootstrap_samples,
+        seed=cfg.strategy_champion_bootstrap_seed,
+    )
+
+
 def _evaluate_strategies(
     valid_games: pd.DataFrame,
     replay_quotes: pd.DataFrame,
@@ -484,6 +571,9 @@ def _evaluate_strategies(
     valid_df: pd.DataFrame,
     probabilities_by_contender: dict[str, np.ndarray],
     contender_rows: dict[str, dict[str, Any]],
+    *,
+    slippage_bps: int,
+    partial_fill_rate: float,
 ) -> list[dict[str, Any]]:
     strategies: list[dict[str, Any]] = []
     strategy_specs = _build_strategy_specs()
@@ -535,6 +625,9 @@ def _evaluate_strategies(
                         "roi": 0.0,
                         "hit_rate": 0.0,
                         "avg_edge_bps": 0.0,
+                        "positive_slice_rate": 0.0,
+                        "roi_ci_lower": 0.0,
+                        "roi_ci_upper": 0.0,
                         "active_slices": 0,
                         "max_slice_bet_share": 0.0,
                         "max_drawdown": 0.0,
@@ -552,19 +645,30 @@ def _evaluate_strategies(
         for spec in strategy_specs:
             actionable = settled[settled["edge_bps"] >= spec.edge_threshold_bps].copy()
             if not actionable.empty:
+                actionable["effective_market_prob"] = _effective_market_probabilities(
+                    actionable["market_prob"],
+                    slippage_bps=slippage_bps,
+                )
+                actionable["effective_implied_decimal_odds"] = 1.0 / actionable["effective_market_prob"]
+                actionable["net_edge_bps"] = (
+                    (actionable["model_prob"] - actionable["effective_market_prob"]) * 10_000.0
+                ).round().astype(int)
+                actionable = actionable[actionable["net_edge_bps"] >= spec.edge_threshold_bps].copy()
+            if not actionable.empty:
                 actionable["stake_units"] = actionable.apply(
                     lambda row: _stake_units(
                         spec.sizing_policy,
                         model_prob=float(row["model_prob"]),
-                        implied_decimal_odds=float(row["implied_decimal_odds"]),
-                        edge_bps=int(row["edge_bps"]),
+                        implied_decimal_odds=float(row["effective_implied_decimal_odds"]),
+                        edge_bps=int(row["net_edge_bps"]),
                     ),
                     axis=1,
                 )
+                actionable["stake_units"] = actionable["stake_units"] * float(np.clip(partial_fill_rate, 0.0, 1.0))
                 actionable = actionable[actionable["stake_units"] > 0].copy()
                 actionable["realized_return_units"] = np.where(
                     actionable["won_bet"],
-                    (actionable["implied_decimal_odds"] - 1.0) * actionable["stake_units"],
+                    (actionable["effective_implied_decimal_odds"] - 1.0) * actionable["stake_units"],
                     -1.0 * actionable["stake_units"],
                 )
             stake_total = float(actionable["stake_units"].sum()) if not actionable.empty else 0.0
@@ -572,11 +676,16 @@ def _evaluate_strategies(
             bets = int(len(actionable))
             slice_metrics = _slice_metrics(actionable)
             active_slices = len([row for row in slice_metrics if row["bets"] > 0])
+            profitable_slices = len([row for row in slice_metrics if row["roi"] > 0.0])
+            positive_slice_rate = float(profitable_slices / active_slices) if active_slices else 0.0
             max_slice_bet_share = max((row["bets"] / bets for row in slice_metrics), default=0.0) if bets else 0.0
+            _, roi_ci_lower, roi_ci_upper = _roi_confidence_interval(actionable)
             guardrails_passed = (
                 bets >= DEFAULT_MIN_BETS
                 and active_slices >= DEFAULT_MIN_ACTIVE_SLICES
                 and max_slice_bet_share <= DEFAULT_MAX_SLICE_BET_SHARE
+                and positive_slice_rate >= DEFAULT_MIN_POSITIVE_SLICE_RATE
+                and roi_ci_lower >= DEFAULT_MIN_ROI_CI_LOWER
             )
             strategies.append(
                 {
@@ -592,7 +701,10 @@ def _evaluate_strategies(
                     "units_won": units_won,
                     "roi": float(units_won / stake_total) if stake_total > 0 else 0.0,
                     "hit_rate": float(actionable["won_bet"].mean()) if bets else 0.0,
-                    "avg_edge_bps": float(actionable["edge_bps"].mean()) if bets else 0.0,
+                    "avg_edge_bps": float(actionable["net_edge_bps"].mean()) if bets else 0.0,
+                    "positive_slice_rate": positive_slice_rate,
+                    "roi_ci_lower": roi_ci_lower,
+                    "roi_ci_upper": roi_ci_upper,
                     "active_slices": active_slices,
                     "max_slice_bet_share": float(max_slice_bet_share),
                     "max_drawdown": _max_drawdown(actionable.sort_values(["game_date", "event_start_time"])["realized_return_units"]) if bets else 0.0,
@@ -611,6 +723,7 @@ def _sort_strategies(strategies: list[dict[str, Any]]) -> list[dict[str, Any]]:
         strategies,
         key=lambda row: (
             bool(row["guardrails_passed"]),
+            float(row["roi_ci_lower"]),
             float(row["roi"]),
             float(row["units_won"]),
             -float(row["max_drawdown"]),
@@ -625,8 +738,26 @@ def run_kalshi_edge_research_backtest(
     train_end_date: str,
     eval_start_date: str,
     eval_end_date: str,
+    *,
+    snapshot_policy: str = DEFAULT_SNAPSHOT_POLICY,
+    slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
+    partial_fill_rate: float = DEFAULT_PARTIAL_FILL_RATE,
 ) -> dict[str, Any]:
-    frames = _load_research_frames(train_start_date, train_end_date, eval_start_date, eval_end_date)
+    if snapshot_policy not in SUPPORTED_SNAPSHOT_POLICIES:
+        raise ValueError(
+            f"Unsupported snapshot_policy={snapshot_policy!r}. "
+            f"Expected one of: {', '.join(SUPPORTED_SNAPSHOT_POLICIES)}"
+        )
+    if not 0.0 < partial_fill_rate <= 1.0:
+        raise ValueError("partial_fill_rate must be in (0, 1].")
+
+    frames = _load_research_frames(
+        train_start_date,
+        train_end_date,
+        eval_start_date,
+        eval_end_date,
+        snapshot_policy=snapshot_policy,
+    )
     combined_results_df = frames["combined_results_df"]
     training_df = frames["training_df"]
     eval_results_df = frames["eval_results_df"]
@@ -667,7 +798,16 @@ def run_kalshi_edge_research_backtest(
     results_lookup = results_lookup[["game_id", "winner_team", "away_score", "home_score"]].drop_duplicates(subset=["game_id"])
 
     probabilities_by_contender, contender_rows, calibration_rows = _fit_and_score_contenders(train_df, valid_df)
-    strategies = _evaluate_strategies(valid_games, replay_quotes, results_lookup, valid_df, probabilities_by_contender, contender_rows)
+    strategies = _evaluate_strategies(
+        valid_games,
+        replay_quotes,
+        results_lookup,
+        valid_df,
+        probabilities_by_contender,
+        contender_rows,
+        slippage_bps=slippage_bps,
+        partial_fill_rate=partial_fill_rate,
+    )
     sorted_strategies = _sort_strategies(strategies)
     eligible = [row for row in sorted_strategies if row["guardrails_passed"]]
     champion = (eligible or sorted_strategies)[0] if sorted_strategies else None
@@ -683,6 +823,9 @@ def run_kalshi_edge_research_backtest(
         "eval_end_date": eval_end_date,
         "replay_rows": int(len(eval_replay_df)),
         "valid_replay_rows": int(len(valid_replay)),
+        "snapshot_policy": snapshot_policy,
+        "slippage_bps": slippage_bps,
+        "partial_fill_rate": partial_fill_rate,
         "contender_count": len(contender_rows),
         "strategy_count": len(sorted_strategies),
         "champion_strategy": champion["strategy_name"] if champion else None,

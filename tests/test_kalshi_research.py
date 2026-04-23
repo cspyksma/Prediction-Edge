@@ -153,10 +153,15 @@ def test_run_kalshi_edge_research_backtest_reports_champion_and_strategy_metadat
     assert result["status"] == "ok"
     assert result["rows_train"] == 4
     assert result["rows_valid"] == 2
+    assert result["snapshot_policy"] == "t_minus_30m"
+    assert result["slippage_bps"] == 25
+    assert result["partial_fill_rate"] == 0.9
     assert result["champion_strategy"] is not None
     assert result["champion_contender"] in {"baseball_logreg_v1", "hybrid_logreg_market_v1", "market_identity_v1"}
     assert result["contender_count"] == 3
     assert result["strategy_count"] > 0
+    assert all("roi_ci_lower" in row for row in result["strategies"])
+    assert all("positive_slice_rate" in row for row in result["strategies"])
     assert any(row["family"] == "hybrid_market_aware" for row in result["strategies"])
     assert any(row["family"] == "market_only" for row in result["strategies"])
 
@@ -194,6 +199,9 @@ def test_format_kalshi_research_output_includes_champion_and_strategy_table() ->
             "eval_end_date": "2026-12-31",
             "replay_rows": 10,
             "valid_replay_rows": 8,
+            "snapshot_policy": "t_minus_30m",
+            "slippage_bps": 25,
+            "partial_fill_rate": 0.9,
             "contender_count": 2,
             "strategy_count": 3,
             "champion_strategy": "hybrid_logreg_market_v1__edge_100bps_flat_1u",
@@ -216,8 +224,11 @@ def test_format_kalshi_research_output_includes_champion_and_strategy_table() ->
                     "family": "hybrid_market_aware",
                     "bets": 42,
                     "roi": 0.084,
+                    "roi_ci_lower": 0.021,
+                    "roi_ci_upper": 0.132,
                     "units_won": 3.53,
                     "max_drawdown": 1.25,
+                    "positive_slice_rate": 0.67,
                     "guardrails_passed": True,
                 }
             ],
@@ -225,6 +236,7 @@ def test_format_kalshi_research_output_includes_champion_and_strategy_table() ->
         }
     )
 
+    assert "snapshot_policy: t_minus_30m" in output
     assert "champion_strategy: hybrid_logreg_market_v1__edge_100bps_flat_1u" in output
     assert "Top Strategies" in output
     assert "hybrid_logreg_market_v1" in output

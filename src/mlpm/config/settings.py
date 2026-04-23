@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import date
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 class Settings(BaseSettings):
@@ -24,21 +25,29 @@ class Settings(BaseSettings):
     strategy_champion_ci_method: str = Field(default="wilson", alias="STRATEGY_CHAMPION_CI_METHOD")
     strategy_champion_bootstrap_samples: int = Field(default=1000, alias="STRATEGY_CHAMPION_BOOTSTRAP_SAMPLES")
     strategy_champion_bootstrap_seed: int = Field(default=42, alias="STRATEGY_CHAMPION_BOOTSTRAP_SEED")
-    duckdb_path: Path = Field(default=Path("data/mlb_markets.duckdb"), alias="DUCKDB_PATH")
-    raw_data_dir: Path = Field(default=Path("data/raw"), alias="RAW_DATA_DIR")
-    processed_data_dir: Path = Field(default=Path("data/processed"), alias="PROCESSED_DATA_DIR")
-    artifacts_dir: Path = Field(default=Path("artifacts"), alias="ARTIFACTS_DIR")
-    mlflow_tracking_uri: str = Field(default="file:./mlruns", alias="MLFLOW_TRACKING_URI")
+    duckdb_path: Path = Field(default=REPO_ROOT / "data" / "mlb_markets.duckdb", alias="DUCKDB_PATH")
+    raw_data_dir: Path = Field(default=REPO_ROOT / "data" / "raw", alias="RAW_DATA_DIR")
+    processed_data_dir: Path = Field(default=REPO_ROOT / "data" / "processed", alias="PROCESSED_DATA_DIR")
+    artifacts_dir: Path = Field(default=REPO_ROOT / "artifacts", alias="ARTIFACTS_DIR")
+    mlflow_tracking_uri: str = Field(default=f"file:{(REPO_ROOT / 'mlruns').as_posix()}", alias="MLFLOW_TRACKING_URI")
     model_home_field_edge_bps: int = Field(default=350, alias="MODEL_HOME_FIELD_EDGE_BPS")
     model_min_games: int = Field(default=25, alias="MODEL_MIN_GAMES")
     model_selection_metric: str = Field(default="log_loss", alias="MODEL_SELECTION_METRIC")
+    # Default covers the full available historical record: SBRO closing-line
+    # moneylines 2015-2021, plus Kalshi ticker-based replay 2025+, plus live
+    # quotes from the current season. Earlier defaults silently restricted
+    # training to the current season, which is why prior runs only learned
+    # from ~2025 data. Override via MODEL_TRAIN_START_DATE if needed.
     model_train_start_date: str = Field(
-        default_factory=lambda: f"{date.today().year}-03-01",
+        default="2015-03-01",
         alias="MODEL_TRAIN_START_DATE",
     )
     kalshi_rate_limit_tier: str = Field(default="basic", alias="KALSHI_RATE_LIMIT_TIER")
     kalshi_read_limit_per_second: int | None = Field(default=None, alias="KALSHI_READ_LIMIT_PER_SECOND")
     kalshi_write_limit_per_second: int | None = Field(default=None, alias="KALSHI_WRITE_LIMIT_PER_SECOND")
+    api_host: str = Field(default="127.0.0.1", alias="API_HOST")
+    api_port: int = Field(default=8000, alias="API_PORT")
+    frontend_dev_origin: str = Field(default="http://127.0.0.1:5173", alias="FRONTEND_DEV_ORIGIN")
 
 
 @lru_cache(maxsize=1)

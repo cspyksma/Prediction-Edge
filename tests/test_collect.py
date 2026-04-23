@@ -31,6 +31,10 @@ def _fake_settings(workspace_dir: Path) -> SimpleNamespace:
     )
 
 
+def _fake_champion_decision(model_name: str = "model") -> SimpleNamespace:
+    return SimpleNamespace(chosen_model=model_name)
+
+
 def test_collect_snapshot_happy_path(monkeypatch) -> None:
     appended: dict[str, pd.DataFrame] = {}
     monkeypatch.setattr("mlpm.pipeline.collect.settings", lambda: _fake_settings(_workspace_dir("collect-happy")))
@@ -113,7 +117,8 @@ def test_collect_snapshot_happy_path(monkeypatch) -> None:
             ]
         ),
     )
-    monkeypatch.setattr("mlpm.pipeline.collect.select_champion_model", lambda: "model")
+    monkeypatch.setattr("mlpm.pipeline.collect.select_champion_with_rationale", lambda: _fake_champion_decision("model"))
+    monkeypatch.setattr("mlpm.pipeline.collect.record_champion_selection", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         "mlpm.pipeline.collect.build_bet_opportunities",
         lambda *args, **kwargs: pd.DataFrame([{"game_id": "g1", "team": "Home", "is_actionable": True}]),
@@ -172,7 +177,8 @@ def test_collect_snapshot_continues_when_kalshi_fails(monkeypatch, caplog) -> No
         ),
     )
     monkeypatch.setattr("mlpm.pipeline.collect.build_model_probabilities", lambda games_df, market_priors_df=None: pd.DataFrame())
-    monkeypatch.setattr("mlpm.pipeline.collect.select_champion_model", lambda: "model")
+    monkeypatch.setattr("mlpm.pipeline.collect.select_champion_with_rationale", lambda: _fake_champion_decision("model"))
+    monkeypatch.setattr("mlpm.pipeline.collect.record_champion_selection", lambda *args, **kwargs: None)
     monkeypatch.setattr("mlpm.pipeline.collect.build_bet_opportunities", lambda *args, **kwargs: pd.DataFrame())
     monkeypatch.setattr("mlpm.pipeline.collect.write_raw_payload", lambda *args, **kwargs: None)
     monkeypatch.setattr("mlpm.pipeline.collect.connect", lambda path: _FakeConnection())
@@ -195,7 +201,8 @@ def test_collect_snapshot_handles_no_games(monkeypatch, caplog) -> None:
     monkeypatch.setattr("mlpm.pipeline.collect.map_kalshi_to_games", lambda markets, games: pd.DataFrame())
     monkeypatch.setattr("mlpm.pipeline.collect.map_market_text_to_games", lambda markets, games, question_field: pd.DataFrame())
     monkeypatch.setattr("mlpm.pipeline.collect.build_model_probabilities", lambda games_df, market_priors_df=None: pd.DataFrame())
-    monkeypatch.setattr("mlpm.pipeline.collect.select_champion_model", lambda: "model")
+    monkeypatch.setattr("mlpm.pipeline.collect.select_champion_with_rationale", lambda: _fake_champion_decision("model"))
+    monkeypatch.setattr("mlpm.pipeline.collect.record_champion_selection", lambda *args, **kwargs: None)
     monkeypatch.setattr("mlpm.pipeline.collect.build_bet_opportunities", lambda *args, **kwargs: pd.DataFrame())
     monkeypatch.setattr("mlpm.pipeline.collect.write_raw_payload", lambda *args, **kwargs: None)
     monkeypatch.setattr("mlpm.pipeline.collect.connect", lambda path: _FakeConnection())

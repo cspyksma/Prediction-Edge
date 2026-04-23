@@ -166,16 +166,21 @@ def collect_snapshot() -> dict[str, int]:
     cfg = settings()
     captured_at = datetime.now(tz=UTC)
     collection_run_ts = captured_at
+    logger.info("collect_snapshot starting captured_at=%s lookahead_days=%s", captured_at.isoformat(), cfg.mlb_lookahead_days)
 
+    logger.info("collect_snapshot fetching upcoming MLB games")
     games_df = fetch_upcoming_games(cfg.mlb_lookahead_days)
+    logger.info("collect_snapshot fetched upcoming games count=%s", len(games_df))
     if games_df.empty:
         logger.warning("Snapshot collection found no upcoming MLB games.")
 
     kalshi_df = pd.DataFrame()
     kalshi_payload: object = []
     try:
+        logger.info("collect_snapshot fetching Kalshi markets")
         kalshi_df, kalshi_payload = fetch_mlb_markets()
         mapped_kalshi = map_kalshi_to_games(kalshi_df, games_df)
+        logger.info("collect_snapshot mapped Kalshi rows raw=%s mapped=%s", len(kalshi_df), len(mapped_kalshi))
     except Exception:
         logger.warning("Kalshi market collection failed; continuing without Kalshi quotes.", exc_info=True)
         mapped_kalshi = pd.DataFrame()
@@ -183,12 +188,15 @@ def collect_snapshot() -> dict[str, int]:
     polymarket_df = pd.DataFrame()
     polymarket_payload: object = []
     try:
+        logger.info("collect_snapshot fetching Polymarket markets")
         polymarket_df, polymarket_payload = fetch_polymarket_markets()
         mapped_polymarket = map_market_text_to_games(polymarket_df, games_df, "question")
+        logger.info("collect_snapshot mapped Polymarket rows raw=%s mapped=%s", len(polymarket_df), len(mapped_polymarket))
     except Exception:
         logger.warning("Polymarket collection failed; continuing without Polymarket quotes.", exc_info=True)
         mapped_polymarket = pd.DataFrame()
 
+    logger.info("collect_snapshot normalizing market quotes")
     normalized_quotes = pd.concat(
         [
             _normalize_market_quotes(mapped_kalshi, "kalshi", captured_at),
@@ -196,29 +204,40 @@ def collect_snapshot() -> dict[str, int]:
         ],
         ignore_index=True,
     )
+    logger.info("collect_snapshot normalized quotes count=%s", len(normalized_quotes))
+    logger.info("collect_snapshot building market priors and model probabilities")
     market_priors = build_market_prior_frame(games_df, normalized_quotes)
     model_predictions = build_model_probabilities(games_df, market_priors_df=market_priors)
+    logger.info("collect_snapshot built model predictions count=%s", len(model_predictions))
     if not games_df.empty:
         games_df["collection_run_ts"] = collection_run_ts
     if not model_predictions.empty:
         model_predictions["collection_run_ts"] = collection_run_ts
+    logger.info("collect_snapshot selecting champion model")
     champion_decision = select_champion_with_rationale()
     champion_model = champion_decision.chosen_model
+    logger.info("collect_snapshot selected champion model=%s", champion_model)
+    logger.info("collect_snapshot building bet opportunities")
     bet_opportunities = build_bet_opportunities(
         games_df,
         normalized_quotes,
         model_predictions,
         champion_model_name=champion_model,
     )
+    logger.info("collect_snapshot built bet opportunities count=%s", len(bet_opportunities))
     if not bet_opportunities.empty:
         bet_opportunities["collection_run_ts"] = collection_run_ts
 
+    logger.info("collect_snapshot writing raw payloads")
     write_raw_payload(cfg.raw_data_dir, "mlb_stats", games_df.to_dict(orient="records"), captured_at)
     write_raw_payload(cfg.raw_data_dir, "kalshi", kalshi_payload, captured_at)
     write_raw_payload(cfg.raw_data_dir, "polymarket", polymarket_payload, captured_at)
 
+    logger.info("collect_snapshot computing discrepancies")
     discrepancies = build_discrepancies(normalized_quotes, model_predictions)
+    logger.info("collect_snapshot computed discrepancies count=%s", len(discrepancies))
 
+    logger.info("collect_snapshot persisting to duckdb path=%s", cfg.duckdb_path)
     conn = connect(cfg.duckdb_path)
     append_dataframe(conn, "games", games_df)
     append_dataframe(
@@ -257,7 +276,7 @@ def collect_snapshot() -> dict[str, int]:
         logger.warning("Failed to record champion selection", exc_info=True)
     conn.close()
 
-    return {
+    counts = {
         "games": len(games_df),
         "kalshi_quotes": len(kalshi_df),
         "polymarket_quotes": len(polymarket_df),
@@ -266,3 +285,5 @@ def collect_snapshot() -> dict[str, int]:
         "discrepancies": len(discrepancies),
         "bet_opportunities": len(bet_opportunities),
     }
+    logger.info("collect_snapshot completed counts=%s", counts)
+    return counts

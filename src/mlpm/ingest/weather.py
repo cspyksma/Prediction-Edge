@@ -48,6 +48,9 @@ logger = logging.getLogger(__name__)
 OPEN_METEO_URL = "https://archive-api.open-meteo.com/v1/archive"
 HTTP_TIMEOUT_SECONDS = 30.0
 THROTTLE_SECONDS = 0.1  # be polite; Open-Meteo doesn't require this but one req / 100ms is fine
+MAX_FETCH_ATTEMPTS = 6
+RETRY_BACKOFF_SECONDS = 2.0
+MAX_RETRY_SLEEP_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -153,9 +156,63 @@ def _fetch_archive(
         "precipitation_unit": "inch",
         "timezone": "auto",  # Open-Meteo infers from lat/lon; all timestamps come back in local time.
     }
-    resp = client.get(OPEN_METEO_URL, params=params, timeout=HTTP_TIMEOUT_SECONDS)
-    resp.raise_for_status()
-    data = resp.json()
+    data: dict[str, object] | None = None
+    last_error: Exception | None = None
+    for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
+        try:
+            resp = client.get(OPEN_METEO_URL, params=params, timeout=HTTP_TIMEOUT_SECONDS)
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except httpx.HTTPStatusError as exc:
+            last_error = exc
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code != 429 or attempt >= MAX_FETCH_ATTEMPTS:
+                raise
+            retry_after = _retry_after_seconds(exc.response)
+            sleep_seconds = retry_after if retry_after is not None else min(
+                MAX_RETRY_SLEEP_SECONDS,
+                RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)),
+            )
+            logger.warning(
+                "Open-Meteo rate limited weather fetch for lat=%s lon=%s start=%s end=%s; "
+                "retrying in %.1fs (attempt %s/%s).",
+                lat,
+                lon,
+                start,
+                end,
+                sleep_seconds,
+                attempt,
+                MAX_FETCH_ATTEMPTS,
+            )
+            time.sleep(sleep_seconds)
+        except httpx.RequestError as exc:
+            last_error = exc
+            if attempt >= MAX_FETCH_ATTEMPTS:
+                raise
+            sleep_seconds = min(
+                MAX_RETRY_SLEEP_SECONDS,
+                RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)),
+            )
+            logger.warning(
+                "Open-Meteo request error for lat=%s lon=%s start=%s end=%s; retrying in %.1fs "
+                "(attempt %s/%s): %s",
+                lat,
+                lon,
+                start,
+                end,
+                sleep_seconds,
+                attempt,
+                MAX_FETCH_ATTEMPTS,
+                exc,
+            )
+            time.sleep(sleep_seconds)
+
+    if data is None:
+        if last_error is not None:
+            raise last_error
+        return pd.DataFrame()
+
     hourly = data.get("hourly") or {}
     times = hourly.get("time") or []
     if not times:
@@ -172,6 +229,18 @@ def _fetch_archive(
     )
     df["timezone"] = data.get("timezone", "UTC")
     return df
+
+
+def _retry_after_seconds(response: httpx.Response | None) -> float | None:
+    if response is None:
+        return None
+    header = response.headers.get("Retry-After")
+    if header is None:
+        return None
+    try:
+        return max(float(header), 0.0)
+    except ValueError:
+        return None
 
 
 def _game_hour(event_start_time, local_tz: str) -> tuple[date, int] | None:

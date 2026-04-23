@@ -15,6 +15,7 @@ Local MLB fair-value research pipeline. The current scope is pregame MLB moneyli
 - Imports historical Kalshi and Polymarket market data into staging tables for later replay/backtesting work.
 - Stores snapshots in DuckDB and raw payloads on disk.
 - Exposes live gaps, settled summaries, and strategy performance in Streamlit.
+- Ships a new local web terminal with a FastAPI backend and React frontend for cockpit, research, and ops workflows.
 
 ## Stack
 
@@ -25,6 +26,8 @@ Local MLB fair-value research pipeline. The current scope is pregame MLB moneyli
 - scikit-learn
 - MLflow
 - Streamlit
+- FastAPI
+- React + Vite
 
 ## Quick Start
 
@@ -67,6 +70,20 @@ python -m mlpm.cli forward-select-game-features --start-date 2026-03-01 --end-da
 
 ```bash
 streamlit run src/mlpm/app/dashboard.py
+```
+
+8a. Start the new local web terminal backend:
+
+```bash
+python -m mlpm.cli run-api --reload
+```
+
+8b. In a second shell, start the new frontend:
+
+```bash
+cd frontend
+npm install
+npm run dev
 ```
 
 9. Review settled predictions, live opportunities, and settled strategy performance:

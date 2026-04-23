@@ -29,6 +29,12 @@ from mlpm.features.utils import coalesce_float, current_streak, normalize_pitche
 from mlpm.ingest.mlb_stats import fetch_final_results, fetch_game_batting_logs, fetch_game_pitching_logs
 from mlpm.storage.duckdb import append_dataframe, connect, query_dataframe
 
+# NOTE: `MLPHomeWinClassifier` (PyTorch) is imported lazily inside
+# ``_build_mlp_pipeline`` so that torch is only required when someone
+# actually trains/benchmarks/scores a model. Pure data commands like
+# ``backfill-mlb`` and ``backfill-weather`` pull game_outcome transitively
+# through cli.py imports and would otherwise crash on boxes without torch.
+
 logger = logging.getLogger(__name__)
 
 LOGISTIC_MODEL_NAME = "mlb_win_logreg_v2"
@@ -36,6 +42,7 @@ HISTGB_MODEL_NAME = "mlb_win_histgb_v1"
 KNN_MODEL_NAME = "mlb_win_knn_v1"
 SVM_MODEL_NAME = "mlb_win_svm_rbf_v1"
 BAYES_MODEL_NAME = "mlb_win_bayes_v1"
+MLP_MODEL_NAME = "mlb_win_mlp_v1"
 FEATURE_COLUMNS = [
     "season_win_pct_diff",
     "recent_win_pct_diff",
@@ -443,6 +450,8 @@ def run_historical_kalshi_backtest(
     train_end_date: str,
     eval_start_date: str,
     eval_end_date: str,
+    *,
+    snapshot_policy: str = "t_minus_30m",
 ) -> dict[str, object]:
     from mlpm.evaluation.strategy import build_bet_opportunities
     from mlpm.historical.replay import build_kalshi_replay_quote_rows, load_kalshi_pregame_replay
@@ -450,7 +459,12 @@ def run_historical_kalshi_backtest(
     combined_results_df = fetch_final_results(train_start_date, eval_end_date)
     if combined_results_df.empty:
         return {"status": "insufficient_data", "rows": 0, "message": "No MLB results found for the combined train/eval window."}
-    replay_df = load_kalshi_pregame_replay(train_start_date, eval_end_date, games_df=combined_results_df)
+    replay_df = load_kalshi_pregame_replay(
+        train_start_date,
+        eval_end_date,
+        games_df=combined_results_df,
+        snapshot_policy=snapshot_policy,
+    )
     eval_results_df = combined_results_df[
         pd.to_datetime(combined_results_df["game_date"]).between(pd.Timestamp(eval_start_date), pd.Timestamp(eval_end_date))
     ].copy()
@@ -585,6 +599,7 @@ def run_historical_kalshi_backtest(
         "train_end_date": train_end_date,
         "eval_start_date": eval_start_date,
         "eval_end_date": eval_end_date,
+        "snapshot_policy": snapshot_policy,
         "replay_rows": len(replay_df),
         "valid_replay_rows": len(valid_replay),
         "champion_model": champion_model,
@@ -941,7 +956,7 @@ def build_live_feature_frame(
 def predict_home_win_probabilities(bundle: dict[str, object], features_df: pd.DataFrame) -> pd.DataFrame:
     if features_df.empty:
         return pd.DataFrame()
-    _require_feature_columns(features_df)
+    feature_columns = _require_feature_columns(features_df, list(bundle.get("feature_columns") or FEATURE_COLUMNS))
     results: list[pd.DataFrame] = []
 
     if bundle.get("bayes_evidence_pipeline") is not None and bundle.get("bayes_base_rate") is not None:
@@ -954,12 +969,12 @@ def predict_home_win_probabilities(bundle: dict[str, object], features_df: pd.Da
     if candidate_pipelines:
         for model_name, pipeline in candidate_pipelines.items():
             scored = features_df.copy()
-            scored["home_win_prob"] = pipeline.predict_proba(scored[FEATURE_COLUMNS])[:, 1]
+            scored["home_win_prob"] = pipeline.predict_proba(scored[feature_columns])[:, 1]
             scored["model_name"] = model_name
             results.append(scored)
     else:
         scored = features_df.copy()
-        scored["home_win_prob"] = bundle["pipeline"].predict_proba(scored[FEATURE_COLUMNS])[:, 1]
+        scored["home_win_prob"] = bundle["pipeline"].predict_proba(scored[feature_columns])[:, 1]
         scored["model_name"] = bundle["model_name"]
         results.append(scored)
 
@@ -973,6 +988,7 @@ def _fit_candidate_models(train_df: pd.DataFrame) -> dict[str, Pipeline]:
         HISTGB_MODEL_NAME: _build_histgb_pipeline(),
         KNN_MODEL_NAME: _build_knn_pipeline(),
         SVM_MODEL_NAME: _build_svm_pipeline(),
+        MLP_MODEL_NAME: _build_mlp_pipeline(),
     }
     for pipeline in models.values():
         pipeline.fit(train_df[FEATURE_COLUMNS], train_df["target_home_win"])
@@ -1245,6 +1261,60 @@ def _build_svm_pipeline() -> Pipeline:
     )
 
 
+def _build_mlp_pipeline() -> Pipeline:
+    """Tabular PyTorch MLP contender.
+
+    Shares the same median-impute + standard-scale front-end as the other
+    distance-sensitive models so raw NaNs never hit the network. The MLP
+    itself is a small 3-hidden-layer feed-forward net with BN+dropout and
+    early stopping on an internal 10% validation slice; see
+    :class:`~mlpm.models.mlp.MLPHomeWinClassifier` for tunables.
+
+    Imported lazily so that torch is only required when a caller actually
+    asks for the MLP contender. Commands that never touch models (e.g.
+    ``backfill-mlb``) keep working on boxes without torch installed.
+    """
+
+    from mlpm.models.mlp import MLPHomeWinClassifier
+
+    return Pipeline(
+        steps=[
+            (
+                "preprocess",
+                ColumnTransformer(
+                    transformers=[
+                        (
+                            "numeric",
+                            Pipeline(
+                                steps=[
+                                    ("impute", SimpleImputer(strategy="median")),
+                                    ("scale", StandardScaler()),
+                                ]
+                            ),
+                            FEATURE_COLUMNS,
+                        )
+                    ]
+                ),
+            ),
+            (
+                "classifier",
+                MLPHomeWinClassifier(
+                    hidden_layers=(128, 64, 32),
+                    dropout=0.25,
+                    learning_rate=1e-3,
+                    weight_decay=1e-4,
+                    batch_size=256,
+                    max_epochs=200,
+                    patience=15,
+                    validation_fraction=0.1,
+                    random_state=42,
+                    use_batch_norm=True,
+                ),
+            ),
+        ]
+    )
+
+
 def _split_training_data(training_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     ordered = training_df.sort_values(["game_date", "game_id"]).reset_index(drop=True)
     split_index = int(len(ordered) * 0.8)
@@ -1253,11 +1323,15 @@ def _split_training_data(training_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Da
     return ordered.iloc[:split_index].copy(), ordered.iloc[split_index:].copy()
 
 
-def _require_feature_columns(frame: pd.DataFrame) -> None:
+def _require_feature_columns(frame: pd.DataFrame, columns: list[str] | None = None) -> list[str]:
+    required_columns = list(columns or FEATURE_COLUMNS)
     for column, default_value in _WEATHER_FEATURE_DEFAULTS.items():
-        if column not in frame.columns:
+        if column in required_columns and column not in frame.columns:
             frame[column] = default_value
-    _require_columns(frame, FEATURE_COLUMNS, frame_name="feature frame")
+    if "market_home_implied_prob" in required_columns and "market_home_implied_prob" not in frame.columns:
+        frame["market_home_implied_prob"] = 0.5
+    _require_columns(frame, required_columns, frame_name="feature frame")
+    return required_columns
 
 
 def _require_columns(frame: pd.DataFrame, columns: list[str], frame_name: str) -> None:
@@ -1685,9 +1759,26 @@ def _load_game_weather(start_date: str, end_date: str) -> pd.DataFrame:
 
 
 def _load_historical_market_priors(start_date: str, end_date: str) -> pd.DataFrame:
+    """Load per-game market-implied home-win probabilities across three sources.
+
+    Stacked by data-availability era (precedence = earlier source wins when a
+    game_id appears in multiple tables):
+
+      1. ``normalized_quotes_deduped`` — live pipeline quotes (Kalshi +
+         Polymarket). Most precise: pre-pitch, devigged, multi-book consensus.
+      2. ``historical_kalshi_quotes`` (via ``load_kalshi_pregame_replay``) —
+         backfilled candle data for the 2025+ seasons where ticker-based
+         replay is available.
+      3. ``historical_market_priors_deduped`` — SportsBookReviewsOnline
+         closing-line moneylines from 2015-2021, devigged via two-way
+         devigger in ``ingest/sbro.py``. This is the ONLY market-prior source
+         for pre-2023 games. Without it, pre-2023 training data has no
+         ``market_home_implied_prob`` signal at all.
+    """
     db_path = settings().duckdb_path
+    empty = pd.DataFrame(columns=["game_id", "market_home_implied_prob", "market_source_count"])
     if not db_path.exists():
-        return pd.DataFrame(columns=["game_id", "market_home_implied_prob", "market_source_count"])
+        return empty
 
     from mlpm.historical.replay import load_kalshi_pregame_replay
 
@@ -1710,26 +1801,48 @@ def _load_historical_market_priors(start_date: str, end_date: str) -> pd.DataFra
             HAVING AVG(CASE WHEN q.outcome_team = g.home_team THEN q.fair_prob END) IS NOT NULL
             """
         )
+        # SBRO-sourced historical priors (2015-2021). The table always carries
+        # both home_fair_prob and a game_id that was resolved against
+        # game_results at ingest time, so a simple date-filter + select gives
+        # us the expected schema. Gracefully degrade if the table is empty or
+        # absent (e.g. fresh checkout that hasn't run `mlpm ingest-sbro`).
+        try:
+            sbro_priors = query_dataframe(
+                conn,
+                f"""
+                SELECT
+                    game_id,
+                    home_fair_prob AS market_home_implied_prob,
+                    1 AS market_source_count
+                FROM historical_market_priors_deduped
+                WHERE game_date BETWEEN DATE '{start_date}' AND DATE '{end_date}'
+                  AND home_fair_prob IS NOT NULL
+                """
+            )
+        except Exception as exc:  # table missing on fresh DB
+            logger.debug("historical_market_priors_deduped unavailable: %s", exc)
+            sbro_priors = pd.DataFrame(
+                columns=["game_id", "market_home_implied_prob", "market_source_count"]
+            )
     finally:
         conn.close()
 
     replay_priors = load_kalshi_pregame_replay(start_date, end_date)
-    if replay_priors.empty:
-        return live_priors
+    if not replay_priors.empty:
+        replay_priors = replay_priors[["game_id", "home_market_prob"]].rename(
+            columns={"home_market_prob": "market_home_implied_prob"}
+        )
+        replay_priors["market_source_count"] = 1
+    else:
+        replay_priors = pd.DataFrame(
+            columns=["game_id", "market_home_implied_prob", "market_source_count"]
+        )
 
-    replay_priors = replay_priors[["game_id", "home_market_prob"]].rename(
-        columns={"home_market_prob": "market_home_implied_prob"}
-    )
-    replay_priors["market_source_count"] = 1
-
-    if live_priors.empty:
-        return replay_priors
-
-    combined = pd.concat(
-        [
-            live_priors,
-            replay_priors[~replay_priors["game_id"].isin(live_priors["game_id"])],
-        ],
-        ignore_index=True,
-    )
-    return combined
+    # Priority: live > kalshi replay > SBRO. `drop_duplicates(keep='first')`
+    # on an in-order concat does exactly that. Rows unique to SBRO (pre-2023)
+    # are preserved; rows that also exist in live quotes keep the live value.
+    merged = pd.concat([live_priors, replay_priors, sbro_priors], ignore_index=True)
+    if merged.empty:
+        return empty
+    merged = merged.drop_duplicates(subset=["game_id"], keep="first")
+    return merged.reset_index(drop=True)

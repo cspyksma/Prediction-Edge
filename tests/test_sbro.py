@@ -12,6 +12,8 @@ import uuid
 import pandas as pd
 import pytest
 
+pytest.importorskip("openpyxl")
+
 from mlpm.ingest.sbro import (
     SBRO_SOURCE,
     load_sbro_into_priors,

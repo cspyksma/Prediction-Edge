@@ -18,20 +18,29 @@
 #
 # What this script does
 # ─────────────────────
-# 1. For each MLB season (March–October), runs:
+# 1. Ingests SBRO (SportsBookReviewsOnline) closing-line workbooks from
+#    ./sbro/*.xlsx covering 2015-2021. This populates
+#    historical_market_priors with a single per-game moneyline close and the
+#    devigged home/away fair probabilities. Idempotent.
+#
+# 2. For each MLB season with a Kalshi ticker (2025+), runs:
 #      mlpm historical-backfill-kalshi --start-date YYYY-03-01 --end-date YYYY-10-31
 #    The backfill is resumable (--no-resume is NOT passed), so re-running this
 #    script safely skips already-completed chunks.
 #
-# 2. Trains the game-outcome model on the full range 2023-03-01 → today:
-#      mlpm train-game-model --start-date 2023-03-01
+# 3. Trains the game-outcome model on the full range 2015-03-01 → today:
+#      mlpm train-game-model --start-date 2015-03-01
 #
 # Notes
 # ─────
-# • Kalshi started MLB game markets around early 2023, so 2022 data is sparse.
-#   The script starts at 2023 by default; edit SEASONS below to extend.
-# • The backfill stores data in the historical_kalshi_quotes DuckDB table, which
-#   is now automatically used by train-game-model via _load_historical_market_priors.
+# • Kalshi MLB game-market tickers only exist from 2025 onward. Pre-2025
+#   market priors come from the SBRO archive (2015-2021). There is a data
+#   gap for 2022-2024 where neither source covers the full season — the
+#   market_home_implied_prob feature will be NaN for those games and the
+#   classifier pipelines median-impute it.
+# • SBRO files live in ./sbro/*.xlsx. The script calls `mlpm ingest-sbro` to
+#   load them into historical_market_priors; train-game-model unions that
+#   table with live quotes + Kalshi replay via _load_historical_market_priors.
 # • Rate limiting: if you see rate_limited_count > 0 in the output, add a small
 #   sleep between seasons or reduce --chunk-days.
 # ---------------------------------------------------------------------------
@@ -42,16 +51,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
 # ── Configuration ──────────────────────────────────────────────────────────
-SEASONS=("2023" "2024" "2025")   # Edit to add/remove seasons
+SEASONS=("2025")                 # Kalshi tickers available 2025+. Pre-2025 priors come from SBRO.
 CHUNK_DAYS=7
 TRAIN_ONLY=false
+SKIP_SBRO=false
 SKIP_SEASONS=()
-TRAIN_START_DATE="2023-03-01"    # Earliest date to train on
+SBRO_DIR="./sbro"                # Location of SportsBookReviewsOnline xlsx archives (2015-2021)
+TRAIN_START_DATE="2015-03-01"    # Earliest date to train on — covers SBRO archive + Kalshi replay
 
 # ── Argument parsing ───────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --train-only)   TRAIN_ONLY=true; shift ;;
+        --skip-sbro)    SKIP_SBRO=true; shift ;;
         --skip-2023)    SKIP_SEASONS+=("2023"); shift ;;
         --skip-2024)    SKIP_SEASONS+=("2024"); shift ;;
         --skip-2025)    SKIP_SEASONS+=("2025"); shift ;;
@@ -67,6 +79,20 @@ should_skip() {
     done
     return 1
 }
+
+# ── SBRO ingest (2015-2021 closing-line moneylines) ────────────────────────
+if [[ "$TRAIN_ONLY" == "false" && "$SKIP_SBRO" == "false" ]]; then
+    if [[ -d "$SBRO_DIR" ]]; then
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "  SBRO Historical Ingest ($SBRO_DIR)"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        mlpm ingest-sbro --directory "$SBRO_DIR"
+        echo "  SBRO ingest complete."
+        echo ""
+    else
+        echo "[skip] SBRO directory '$SBRO_DIR' not found — skipping SBRO ingest."
+    fi
+fi
 
 # ── Backfill ───────────────────────────────────────────────────────────────
 if [[ "$TRAIN_ONLY" == "false" ]]; then

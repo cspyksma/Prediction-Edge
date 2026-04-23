@@ -8,7 +8,38 @@ from mlpm.config.settings import settings
 from mlpm.storage.duckdb import connect_read_only, query_dataframe
 
 
-def load_kalshi_pregame_replay(start_date: str, end_date: str, games_df: pd.DataFrame | None = None):
+SUPPORTED_SNAPSHOT_POLICIES = ("last_pregame", "t_minus_60m", "t_minus_30m", "t_minus_10m")
+
+
+def _snapshot_policy_minutes(snapshot_policy: str) -> int:
+    policy = snapshot_policy.strip().lower()
+    if policy == "last_pregame":
+        return 0
+    known_lags = {
+        "t_minus_60m": 60,
+        "t_minus_30m": 30,
+        "t_minus_10m": 10,
+    }
+    if policy in known_lags:
+        return known_lags[policy]
+    raise ValueError(
+        f"Unsupported snapshot_policy={snapshot_policy!r}. "
+        f"Expected one of: {', '.join(SUPPORTED_SNAPSHOT_POLICIES)}"
+    )
+
+
+def load_kalshi_pregame_replay(
+    start_date: str,
+    end_date: str,
+    games_df: pd.DataFrame | None = None,
+    *,
+    snapshot_policy: str = "last_pregame",
+):
+    lag_minutes = _snapshot_policy_minutes(snapshot_policy)
+    cutoff_expression = "COALESCE(q.event_start_time, CAST(g.event_start_time AS TIMESTAMP))"
+    if lag_minutes > 0:
+        cutoff_expression = f"{cutoff_expression} - INTERVAL '{lag_minutes} minutes'"
+
     conn = connect_read_only(settings().duckdb_path)
     try:
         if games_df is not None:
@@ -46,7 +77,7 @@ def load_kalshi_pregame_replay(start_date: str, end_date: str, games_df: pd.Data
                   AND q.game_id IS NOT NULL
                   AND q.outcome_team IS NOT NULL
                   AND q.home_implied_prob IS NOT NULL
-                  AND q.quote_ts <= COALESCE(q.event_start_time, CAST(g.event_start_time AS TIMESTAMP))
+                  AND q.quote_ts <= {cutoff_expression}
             ),
             selected AS (
                 SELECT *
@@ -94,6 +125,8 @@ def load_kalshi_pregame_replay(start_date: str, end_date: str, games_df: pd.Data
                 game_date,
                 event_start_time,
                 snapshot_ts,
+                '{snapshot_policy}' AS snapshot_policy,
+                {lag_minutes} AS snapshot_min_lag_minutes,
                 home_quote_ts,
                 away_quote_ts,
                 home_team,

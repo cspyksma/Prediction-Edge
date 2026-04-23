@@ -7,7 +7,12 @@ from typing import Any
 
 from mlpm.backtest.run_backtest import run_backtest
 from mlpm.backtest.walkforward import DEFAULT_EDGE_THRESHOLD, run_walkforward_backtest
-from mlpm.backtest.research import run_kalshi_edge_research_backtest
+from mlpm.backtest.research import (
+    DEFAULT_PARTIAL_FILL_RATE,
+    DEFAULT_SLIPPAGE_BPS,
+    DEFAULT_SNAPSHOT_POLICY,
+    run_kalshi_edge_research_backtest,
+)
 from mlpm.pipeline.collect import collect_snapshot
 from mlpm.pipeline.runner import run_service, sync_recent_game_results
 from mlpm.config.settings import settings
@@ -194,6 +199,12 @@ def _build_parser() -> argparse.ArgumentParser:
     historical_backtest.add_argument("--train-end-date", type=_iso_date_arg)
     historical_backtest.add_argument("--eval-start-date", type=_iso_date_arg)
     historical_backtest.add_argument("--eval-end-date", type=_iso_date_arg)
+    historical_backtest.add_argument(
+        "--snapshot-policy",
+        default=DEFAULT_SNAPSHOT_POLICY,
+        choices=("last_pregame", "t_minus_60m", "t_minus_30m", "t_minus_10m"),
+        help="Historical quote snapshot policy to simulate actionability.",
+    )
 
     kalshi_research = subparsers.add_parser(
         "research-kalshi-edge",
@@ -203,6 +214,24 @@ def _build_parser() -> argparse.ArgumentParser:
     kalshi_research.add_argument("--train-end-date", required=True, type=_iso_date_arg)
     kalshi_research.add_argument("--eval-start-date", required=True, type=_iso_date_arg)
     kalshi_research.add_argument("--eval-end-date", required=True, type=_iso_date_arg)
+    kalshi_research.add_argument(
+        "--snapshot-policy",
+        default=DEFAULT_SNAPSHOT_POLICY,
+        choices=("last_pregame", "t_minus_60m", "t_minus_30m", "t_minus_10m"),
+        help="Historical quote snapshot policy to simulate actionability.",
+    )
+    kalshi_research.add_argument(
+        "--slippage-bps",
+        type=int,
+        default=DEFAULT_SLIPPAGE_BPS,
+        help="Adverse price slippage, in basis points, applied before edge filtering.",
+    )
+    kalshi_research.add_argument(
+        "--partial-fill-rate",
+        type=float,
+        default=DEFAULT_PARTIAL_FILL_RATE,
+        help="Fraction of intended stake assumed to fill (0 < rate <= 1).",
+    )
 
     backtest = subparsers.add_parser("backtest", help="Run a simple backtest over stored data.")
     backtest.add_argument("--start-date", required=True, type=_iso_date_arg)
@@ -222,6 +251,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     select_features.add_argument("--start-date", default=settings().model_train_start_date, type=_iso_date_arg)
     select_features.add_argument("--end-date", default=date.today().isoformat(), type=_iso_date_arg)
+
+    serve_api = subparsers.add_parser("run-api", help="Run the local FastAPI backend for the web dashboard.")
+    serve_api.add_argument("--host", default=settings().api_host)
+    serve_api.add_argument("--port", type=int, default=settings().api_port)
+    serve_api.add_argument("--reload", action="store_true", help="Enable auto-reload for local development.")
 
     return parser
 
@@ -668,6 +702,7 @@ def _format_historical_backtest_output(result: dict[str, Any]) -> str:
         f"rows_valid: {result['rows_valid']}",
         f"train_window: {result['train_start_date']} to {result['train_end_date']}",
         f"eval_window: {result['eval_start_date']} to {result['eval_end_date']}",
+        f"snapshot_policy: {result.get('snapshot_policy', 'last_pregame')}",
         f"replay_rows: {result['replay_rows']}",
         f"valid_replay_rows: {result['valid_replay_rows']}",
         f"champion_model: {result['champion_model']}",
@@ -692,6 +727,9 @@ def _format_kalshi_research_output(result: dict[str, Any]) -> str:
         f"eval_window: {result['eval_start_date']} to {result['eval_end_date']}",
         f"replay_rows: {result['replay_rows']}",
         f"valid_replay_rows: {result['valid_replay_rows']}",
+        f"snapshot_policy: {result['snapshot_policy']}",
+        f"slippage_bps: {result['slippage_bps']}",
+        f"partial_fill_rate: {result['partial_fill_rate']:.2f}",
         f"contender_count: {result['contender_count']}",
         f"strategy_count: {result['strategy_count']}",
         f"champion_strategy: {result['champion_strategy']}",
@@ -714,14 +752,15 @@ def _format_kalshi_research_output(result: dict[str, Any]) -> str:
     strategies = result.get("strategies", [])
     if strategies:
         lines.extend(["", "Top Strategies"])
-        header = "strategy | family | bets | roi | units | drawdown | guardrails"
+        header = "strategy | family | bets | roi | roi_ci | units | drawdown | pos_slices | guardrails"
         lines.append(header)
         lines.append("-" * len(header))
         for row in strategies[:20]:
             lines.append(
                 f"{row['strategy_name']} | {row['family']} | {row['bets']} | "
-                f"{row['roi']:.4f} | {row['units_won']:.2f} | {row['max_drawdown']:.2f} | "
-                f"{row['guardrails_passed']}"
+                f"{row['roi']:.4f} | [{row['roi_ci_lower']:.4f}, {row['roi_ci_upper']:.4f}] | "
+                f"{row['units_won']:.2f} | {row['max_drawdown']:.2f} | "
+                f"{row['positive_slice_rate']:.2f} | {row['guardrails_passed']}"
             )
     calibration = result.get("calibration", [])
     if calibration:
@@ -762,6 +801,12 @@ def app() -> None:
 
     if args.command == "run-service":
         run_service(iterations=args.iterations)
+        return
+
+    if args.command == "run-api":
+        import uvicorn
+
+        uvicorn.run("mlpm.api.app:app", host=args.host, port=args.port, reload=args.reload)
         return
 
     if args.command == "sync-results":
@@ -900,6 +945,7 @@ def app() -> None:
                     train_end_date=train_end_date,
                     eval_start_date=eval_start_date,
                     eval_end_date=eval_end_date,
+                    snapshot_policy=args.snapshot_policy,
                 )
             )
         )
@@ -915,6 +961,9 @@ def app() -> None:
                     train_end_date=args.train_end_date,
                     eval_start_date=args.eval_start_date,
                     eval_end_date=args.eval_end_date,
+                    snapshot_policy=args.snapshot_policy,
+                    slippage_bps=args.slippage_bps,
+                    partial_fill_rate=args.partial_fill_rate,
                 )
             )
         )

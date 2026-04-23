@@ -267,6 +267,17 @@ def test_cli_parser_normalizes_valid_iso_dates() -> None:
     assert args.end_date == "2026-04-07"
 
 
+def test_cli_parser_supports_run_api_command() -> None:
+    parser = _build_parser()
+
+    args = parser.parse_args(["run-api", "--host", "0.0.0.0", "--port", "9000", "--reload"])
+
+    assert args.command == "run-api"
+    assert args.host == "0.0.0.0"
+    assert args.port == 9000
+    assert args.reload is True
+
+
 def test_cli_app_rejects_reversed_backtest_range(monkeypatch) -> None:
     monkeypatch.setattr(
         "sys.argv",
