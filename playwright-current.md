@@ -1,0 +1,30 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e5]:
+      - text: MLPM EXCHANGE
+      - heading "Desk Terminal" [level=1] [ref=e6]
+      - paragraph [ref=e7]: Live MLB market monitoring, model pricing, and execution ops.
+    - navigation [ref=e8]:
+      - link "Cockpit" [ref=e9] [cursor=pointer]:
+        - /url: /
+      - link "Research" [ref=e10] [cursor=pointer]:
+        - /url: /research
+      - link "Ops" [ref=e11] [cursor=pointer]:
+        - /url: /ops
+    - generic [ref=e12]:
+      - generic [ref=e13]: Champion
+      - generic [ref=e14]: Unknown
+    - generic [ref=e15]:
+      - generic [ref=e16]: Staleness
+      - generic [ref=e17]: Live
+    - generic [ref=e18]:
+      - generic [ref=e19]: Discrepancies
+      - generic [ref=e20]: "0"
+  - main [ref=e21]:
+    - generic [ref=e22]:
+      - generic [ref=e23]
+      - generic [ref=e26]
+    - generic [ref=e36]:
+      - generic [ref=e37]
+      - generic [ref=e53]
+      - generic [ref=e96]
