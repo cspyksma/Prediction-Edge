@@ -78,13 +78,22 @@ streamlit run src/mlpm/app/dashboard.py
 python -m mlpm.cli run-api --reload
 ```
 
-8b. In a second shell, start the new frontend:
+The API defaults to `http://127.0.0.1:8000` and serves routes under `/api/v1`.
+
+8b. In a second shell, install the frontend dependencies once and start Vite:
 
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
+
+Open `http://127.0.0.1:5173/`.
+
+During local development, Vite proxies `/api/*` to the FastAPI backend on port
+`8000`, so the frontend does not need a hard-coded API host. For non-default
+deployments, set `VITE_API_BASE` or change the proxy target in
+`frontend/vite.config.ts`.
 
 9. Review settled predictions, live opportunities, and settled strategy performance:
 
@@ -139,6 +148,7 @@ pure winner prediction.
 - Histogram gradient boosting.
 - K-nearest neighbors.
 - SVM.
+- PyTorch MLP tabular classifier.
 - Heuristic legacy baselines.
 - Bayesian posterior path that combines a prior with a baseball-feature evidence model.
 
@@ -186,12 +196,14 @@ python -m mlpm.cli ingest-sbro --directory sbro
 ## Running Unattended
 
 - Use `python -m mlpm.cli run-service` for the durable collector process.
+- Use `python -m mlpm.cli run-api` for the local FastAPI backend that powers the React dashboard.
 - Set `SNAPSHOT_INTERVAL_SECONDS` for polling cadence.
 - Set `RUNNER_FAILURE_BACKOFF_SECONDS` for retry delay after an API or network failure.
 - Set `RESULTS_SYNC_LOOKBACK_DAYS` to control how far back the service rechecks completed MLB games.
 - Set `STRATEGY_EDGE_THRESHOLD_BPS` to define the minimum actionable edge.
 - The service writes run health into DuckDB table `collector_runs` and final scores into `game_results`.
 - Strategy rows are written to `bet_opportunities` and settled ROI is available through `settled_bet_opportunities_deduped`.
+- Dashboard job launches from the Ops page write logs under `data/dashboard_jobs/` and remain visible after API reloads/restarts.
 - On Windows, run the command under Task Scheduler or NSSM so it restarts on login/reboot.
 
 ## Data Layout
