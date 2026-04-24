@@ -8,15 +8,31 @@ export function CockpitPage() {
   const summary = useQuery({ queryKey: ["summary"], queryFn: api.summary, refetchInterval: 15000 });
   const opportunities = useQuery({ queryKey: ["opportunities"], queryFn: api.opportunities, refetchInterval: 15000 });
   const rows = opportunities.data?.items ?? [];
-  const [selectedGameId, setSelectedGameId] = useState<string | null>(null);
+  const championModelName = opportunities.data?.champion_model ?? summary.data?.champion_model ?? null;
+  const championRows = useMemo(() => {
+    if (championModelName) {
+      return rows.filter((row) => row.model_name === championModelName);
+    }
+    return rows.filter((row) => row.is_champion);
+  }, [championModelName, rows]);
+  const displayRows = championRows.length > 0 ? championRows : rows;
+  const [selectedOpportunityKey, setSelectedOpportunityKey] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!selectedGameId && rows.length > 0) {
-      setSelectedGameId(rows[0].game_id);
+    if (!selectedOpportunityKey && displayRows.length > 0) {
+      setSelectedOpportunityKey(opportunityKey(displayRows[0]));
     }
-  }, [rows, selectedGameId]);
+  }, [displayRows, selectedOpportunityKey]);
 
-  const selectedOpportunity = rows.find((row) => row.game_id === selectedGameId) ?? rows[0] ?? null;
+  useEffect(() => {
+    if (!selectedOpportunityKey) return;
+    if (!displayRows.some((row) => opportunityKey(row) === selectedOpportunityKey)) {
+      setSelectedOpportunityKey(displayRows[0] ? opportunityKey(displayRows[0]) : null);
+    }
+  }, [displayRows, selectedOpportunityKey]);
+
+  const selectedOpportunity =
+    displayRows.find((row) => opportunityKey(row) === selectedOpportunityKey) ?? displayRows[0] ?? null;
   const detail = useQuery({
     queryKey: ["game-detail", selectedOpportunity?.game_id],
     queryFn: () => api.gameDetail(selectedOpportunity!.game_id),
@@ -53,11 +69,18 @@ export function CockpitPage() {
           <div className="panel-header">
             <div>
               <p className="panel-kicker">Primary blotter</p>
-              <h3>Opportunity ladder</h3>
+              <h3>{championRows.length > 0 ? "Champion ladder" : "Opportunity ladder"}</h3>
             </div>
-            <span>{opportunities.data?.total ?? 0} actionable rows</span>
+            <span>
+              {displayRows.length}
+              {championRows.length > 0 ? ` champion rows (${opportunities.data?.total ?? 0} total)` : " actionable rows"}
+            </span>
           </div>
-          <OpportunityBlotter rows={rows} selectedGameId={selectedOpportunity?.game_id ?? null} onSelect={setSelectedGameId} />
+          <OpportunityBlotter
+            rows={displayRows}
+            selectedOpportunityKey={selectedOpportunity ? opportunityKey(selectedOpportunity) : null}
+            onSelect={setSelectedOpportunityKey}
+          />
         </div>
 
         <div className="side-stack">
@@ -490,12 +513,12 @@ export function OpsPage() {
 
 function OpportunityBlotter({
   rows,
-  selectedGameId,
+  selectedOpportunityKey,
   onSelect,
 }: {
   rows: Opportunity[];
-  selectedGameId: string | null;
-  onSelect: (gameId: string) => void;
+  selectedOpportunityKey: string | null;
+  onSelect: (opportunityKey: string) => void;
 }) {
   return (
     <div className="blotter-wrap">
@@ -509,9 +532,10 @@ function OpportunityBlotter({
         </thead>
         <tbody>
           {rows.map((row, index) => {
-            const selected = row.game_id === selectedGameId;
+            const rowKey = opportunityKey(row);
+            const selected = rowKey === selectedOpportunityKey;
             return (
-              <tr key={`${row.game_id}-${row.model_name}-${row.market_id ?? "market"}-${index}`} className={selected ? "selected-row" : undefined} onClick={() => onSelect(row.game_id)}>
+              <tr key={`${rowKey}-${index}`} className={selected ? "selected-row" : undefined} onClick={() => onSelect(rowKey)}>
                 <td className="mono">{index + 1}</td>
                 <td><span className="signal-pill">LONG</span></td>
                 <td>
@@ -533,6 +557,10 @@ function OpportunityBlotter({
       </table>
     </div>
   );
+}
+
+function opportunityKey(row: Opportunity): string {
+  return [row.game_id, row.team, row.model_name, row.source ?? "", row.market_id ?? ""].join("|");
 }
 
 function BarPanel({

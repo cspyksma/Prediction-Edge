@@ -53,6 +53,23 @@ class JobRecord:
 _JOB_REGISTRY: list[JobRecord] = []
 
 
+def _resolve_job_python() -> str:
+    venv_python = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+    if venv_python.exists():
+        return str(venv_python)
+    return sys.executable
+
+
+def _job_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    for key in tuple(env):
+        if key.startswith("COVERAGE_"):
+            env.pop(key, None)
+    for key in ("PYTHONHOME", "PYTHONPATH", "__PYVENV_LAUNCHER__"):
+        env.pop(key, None)
+    return env
+
+
 def _metadata_path(log_path: Path) -> Path:
     return log_path.with_suffix(".json")
 
@@ -191,19 +208,26 @@ def start_job(command_key: str) -> JobRecord:
     if command_key not in JOB_COMMANDS:
         raise KeyError(f"Unknown job command: {command_key}")
     spec = JOB_COMMANDS[command_key]
+    python_executable = _resolve_job_python()
+    job_env = _job_environment()
     job_id = datetime.now().strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:6]
     log_path = JOBS_DIR / f"{command_key}-{job_id}.log"
     log_file = open(log_path, "w", buffering=1)
     log_file.write(f"[{datetime.now().isoformat()}] starting job={command_key} label={spec['label']}\n")
-    log_file.write(f"[{datetime.now().isoformat()}] command={sys.executable} -u -m mlpm.cli {' '.join(spec['args'])}\n")
+    log_file.write(f"[{datetime.now().isoformat()}] command={python_executable} -u -m mlpm.cli {' '.join(spec['args'])}\n")
     log_file.write(f"[{datetime.now().isoformat()}] cwd={PROJECT_ROOT}\n")
     log_file.flush()
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
     proc = subprocess.Popen(
-        [sys.executable, "-u", "-m", "mlpm.cli", *spec["args"]],
+        [python_executable, "-u", "-m", "mlpm.cli", *spec["args"]],
         stdout=log_file,
         stderr=subprocess.STDOUT,
         cwd=str(PROJECT_ROOT),
+        env=job_env,
         text=True,
+        creationflags=creationflags,
     )
     job = JobRecord(
         id=job_id,
