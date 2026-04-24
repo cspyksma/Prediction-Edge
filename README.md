@@ -25,7 +25,6 @@ Local MLB fair-value research pipeline. The current scope is pregame MLB moneyli
 - duckdb
 - scikit-learn
 - MLflow
-- Streamlit
 - FastAPI
 - React + Vite
 
