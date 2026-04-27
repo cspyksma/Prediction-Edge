@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from mlpm.api.jobs import JOB_COMMANDS, get_job, list_jobs, read_log_tail, start_job
 from mlpm.api.schemas import (
     CalibrationRow,
+    ChampionStandingsResponse,
     FeatureImportanceRow,
     FreshnessResponse,
     GameDetailResponse,
@@ -26,6 +27,7 @@ from mlpm.api.schemas import (
 )
 from mlpm.api.services import (
     get_calibration,
+    get_champion_standings,
     get_feature_importance,
     get_freshness,
     get_game_detail,
@@ -40,7 +42,7 @@ from mlpm.api.services import (
     list_opportunities,
 )
 from mlpm.config.settings import settings
-from mlpm.storage.duckdb import connect
+from mlpm.storage.duckdb import ensure_database
 
 
 def _serialize_job(job, *, include_log: bool = False) -> dict:
@@ -65,7 +67,8 @@ def _serialize_job(job, *, include_log: bool = False) -> dict:
 def create_app() -> FastAPI:
     cfg = settings()
     cfg.duckdb_path.parent.mkdir(parents=True, exist_ok=True)
-    connect(cfg.duckdb_path).close()
+    if not cfg.duckdb_path.exists():
+        ensure_database(cfg.duckdb_path)
     app = FastAPI(title="MLPM Local API", version="0.1.0")
     app.add_middleware(
         CORSMiddleware,
@@ -124,6 +127,10 @@ def create_app() -> FastAPI:
     @app.get("/api/v1/research/strategies", response_model=list[ResearchStrategyRow])
     def research_strategies() -> list[ResearchStrategyRow]:
         return [ResearchStrategyRow(**row) for row in get_research_strategies()]
+
+    @app.get("/api/v1/research/champion-standings", response_model=ChampionStandingsResponse)
+    def research_champion_standings() -> ChampionStandingsResponse:
+        return ChampionStandingsResponse(**get_champion_standings())
 
     @app.get("/api/v1/research/calibration", response_model=list[CalibrationRow])
     def research_calibration(bins: int = Query(default=10, ge=2, le=50)) -> list[CalibrationRow]:

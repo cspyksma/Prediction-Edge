@@ -190,3 +190,77 @@ def test_run_strategy_performance_report_parameterizes_model_name(monkeypatch) -
     result = run_strategy_performance_report("2026-04-14", "2026-04-14", model_name="safe_model' OR 1=1 --")
 
     assert result == {"status": "insufficient_data", "rows": 0}
+
+
+def test_select_champion_model_ignores_pre_2025_bets(monkeypatch) -> None:
+    db_path = _workspace_db_path("strategy-season-floor")
+    monkeypatch.setenv("DUCKDB_PATH", str(db_path))
+    monkeypatch.setenv("STRATEGY_CHAMPION_MIN_BETS", "1")
+    monkeypatch.setenv("BETTING_STATS_START_DATE", "2025-01-01")
+    settings.cache_clear()
+    conn = connect(settings().duckdb_path)
+    append_dataframe(
+        conn,
+        "bet_opportunities",
+        pd.DataFrame(
+            [
+                {
+                    "game_id": "old-win",
+                    "game_date": "2024-09-01",
+                    "event_start_time": "2024-09-01T18:00:00",
+                    "snapshot_ts": "2024-09-01T17:00:00",
+                    "collection_run_ts": "2024-09-01T17:00:00",
+                    "model_name": "old_model",
+                    "source": "kalshi",
+                    "market_id": "m-old",
+                    "team": "Home",
+                    "opponent_team": "Away",
+                    "is_home_team": True,
+                    "model_prob": 0.70,
+                    "market_prob": 0.50,
+                    "edge_bps": 2000,
+                    "expected_value": 0.40,
+                    "implied_decimal_odds": 2.0,
+                    "stake_units": 1.0,
+                    "is_actionable": True,
+                    "is_champion": False,
+                },
+                {
+                    "game_id": "new-win",
+                    "game_date": "2026-04-14",
+                    "event_start_time": "2026-04-14T18:00:00",
+                    "snapshot_ts": "2026-04-14T17:00:00",
+                    "collection_run_ts": "2026-04-14T17:00:00",
+                    "model_name": "new_model",
+                    "source": "kalshi",
+                    "market_id": "m-new",
+                    "team": "Home2",
+                    "opponent_team": "Away2",
+                    "is_home_team": True,
+                    "model_prob": 0.60,
+                    "market_prob": 0.50,
+                    "edge_bps": 1000,
+                    "expected_value": 0.20,
+                    "implied_decimal_odds": 2.0,
+                    "stake_units": 1.0,
+                    "is_actionable": True,
+                    "is_champion": False,
+                },
+            ]
+        ),
+    )
+    append_dataframe(
+        conn,
+        "game_results",
+        pd.DataFrame(
+            [
+                {"game_id": "old-win", "game_date": "2024-09-01", "away_team": "Away", "home_team": "Home", "winner_team": "Home", "away_score": 2, "home_score": 4},
+                {"game_id": "new-win", "game_date": "2026-04-14", "away_team": "Away2", "home_team": "Home2", "winner_team": "Home2", "away_score": 1, "home_score": 3},
+            ]
+        ),
+    )
+    conn.close()
+
+    champion = select_champion_model()
+
+    assert champion == "new_model"

@@ -9,30 +9,22 @@ export function CockpitPage() {
   const opportunities = useQuery({ queryKey: ["opportunities"], queryFn: api.opportunities, refetchInterval: 15000 });
   const rows = opportunities.data?.items ?? [];
   const championModelName = opportunities.data?.champion_model ?? summary.data?.champion_model ?? null;
-  const championRows = useMemo(() => {
-    if (championModelName) {
-      return rows.filter((row) => row.model_name === championModelName);
-    }
-    return rows.filter((row) => row.is_champion);
-  }, [championModelName, rows]);
-  const displayRows = championRows.length > 0 ? championRows : rows;
   const [selectedOpportunityKey, setSelectedOpportunityKey] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!selectedOpportunityKey && displayRows.length > 0) {
-      setSelectedOpportunityKey(opportunityKey(displayRows[0]));
+    if (!selectedOpportunityKey && rows.length > 0) {
+      setSelectedOpportunityKey(opportunityKey(rows[0]));
     }
-  }, [displayRows, selectedOpportunityKey]);
+  }, [rows, selectedOpportunityKey]);
 
   useEffect(() => {
     if (!selectedOpportunityKey) return;
-    if (!displayRows.some((row) => opportunityKey(row) === selectedOpportunityKey)) {
-      setSelectedOpportunityKey(displayRows[0] ? opportunityKey(displayRows[0]) : null);
+    if (!rows.some((row) => opportunityKey(row) === selectedOpportunityKey)) {
+      setSelectedOpportunityKey(rows[0] ? opportunityKey(rows[0]) : null);
     }
-  }, [displayRows, selectedOpportunityKey]);
+  }, [rows, selectedOpportunityKey]);
 
-  const selectedOpportunity =
-    displayRows.find((row) => opportunityKey(row) === selectedOpportunityKey) ?? displayRows[0] ?? null;
+  const selectedOpportunity = rows.find((row) => opportunityKey(row) === selectedOpportunityKey) ?? rows[0] ?? null;
   const detail = useQuery({
     queryKey: ["game-detail", selectedOpportunity?.game_id],
     queryFn: () => api.gameDetail(selectedOpportunity!.game_id),
@@ -69,15 +61,12 @@ export function CockpitPage() {
           <div className="panel-header">
             <div>
               <p className="panel-kicker">Primary blotter</p>
-              <h3>{championRows.length > 0 ? "Champion ladder" : "Opportunity ladder"}</h3>
+              <h3>Opportunity ladder</h3>
             </div>
-            <span>
-              {displayRows.length}
-              {championRows.length > 0 ? ` champion rows (${opportunities.data?.total ?? 0} total)` : " actionable rows"}
-            </span>
+            <span>{rows.length} actionable rows</span>
           </div>
           <OpportunityBlotter
-            rows={displayRows}
+            rows={rows}
             selectedOpportunityKey={selectedOpportunity ? opportunityKey(selectedOpportunity) : null}
             onSelect={setSelectedOpportunityKey}
           />
@@ -190,6 +179,7 @@ export function CockpitPage() {
 
 export function ResearchPage() {
   const strategies = useQuery({ queryKey: ["strategies"], queryFn: api.strategies });
+  const championStandings = useQuery({ queryKey: ["champion-standings"], queryFn: api.championStandings });
   const calibration = useQuery({ queryKey: ["calibration"], queryFn: api.calibration });
   const featureImportance = useQuery({ queryKey: ["feature-importance"], queryFn: api.featureImportance });
   const coverage = useQuery({ queryKey: ["training-coverage"], queryFn: api.trainingCoverage });
@@ -247,6 +237,36 @@ export function ResearchPage() {
           <span>{strategies.data?.length ?? 0} entries</span>
         </div>
         <BarPanel data={strategyChart} dataKey="roi" color="#00d0a3" suffix="%" />
+      </div>
+
+      <div className="panel panel-span-2">
+        <div className="panel-header">
+          <div>
+            <p className="panel-kicker">Champion engine</p>
+            <h3>2025+ settled standings</h3>
+          </div>
+          <span>{championStandings.data?.champion_model ? `Champion: ${compactLabel(championStandings.data.champion_model)}` : "No champion"}</span>
+        </div>
+        <div className="detail-list">
+          <DetailRow label="Stats start" value={championStandings.data?.betting_stats_start_date ?? "-"} />
+          <DetailRow label="Decision" value={championStandings.data?.decision_action ?? "-"} />
+          <DetailRow label="Reason" value={championStandings.data?.decision_reason ?? "-"} />
+        </div>
+        <SimpleTable
+          headers={["Model", "Role", "Bets", "Wins", "Win rate", "ROI", "Units", "Avg edge", "CI", "Span"]}
+          rows={(championStandings.data?.rows ?? []).map((row) => [
+            compactLabel(row.model_name),
+            <span className={`pill compact ${row.is_champion ? "ok" : "neutral"}`}>{row.is_champion ? "champion" : "challenger"}</span>,
+            String(row.bets),
+            String(row.wins),
+            row.win_rate != null ? fmtPct(row.win_rate) : "-",
+            row.roi != null ? <span className={row.roi >= 0 ? "text-positive" : "text-negative"}>{fmtPct(row.roi)}</span> : "-",
+            row.units_won != null ? <span className={row.units_won >= 0 ? "text-positive" : "text-negative"}>{row.units_won.toFixed(2)}</span> : "-",
+            row.avg_edge_bps != null ? `${Math.round(row.avg_edge_bps)} bps` : "-",
+            row.ci_lower != null && row.ci_upper != null ? `${fmtPct(row.ci_lower)} to ${fmtPct(row.ci_upper)}` : "-",
+            row.first_game_date && row.last_game_date ? `${row.first_game_date} -> ${row.last_game_date}` : "-",
+          ])}
+        />
       </div>
 
       <div className="panel chart-panel">

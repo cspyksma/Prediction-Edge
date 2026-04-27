@@ -2,6 +2,7 @@
 
 import type {
   CalibrationRow,
+  ChampionStandings,
   Contender,
   FeatureImportance,
   Freshness,
@@ -36,6 +37,7 @@ export const api = {
   gameDetail: (gameId: string) => request<GameDetail>(`/cockpit/games/${gameId}`),
   contenders: () => request<Contender[]>("/research/contenders"),
   strategies: () => request<Strategy[]>("/research/strategies"),
+  championStandings: () => request<ChampionStandings>("/research/champion-standings"),
   calibration: () => request<CalibrationRow[]>("/research/calibration"),
   featureImportance: () => request<FeatureImportance[]>("/research/feature-importance?limit=100"),
   trainingCoverage: () => request<TrainingCoverage>("/research/training-coverage"),

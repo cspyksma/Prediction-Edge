@@ -104,23 +104,18 @@ def _current_incumbent(conn) -> str | None:
 
 
 def _window_performance(conn, window_days: int, min_bets: int) -> pd.DataFrame:
-    """Return per-model performance frame with CI bounds over the evaluation window."""
+    """Return per-model performance frame with CI bounds over the configured betting-stats era."""
     cfg = settings()
     frame = query_dataframe(
         conn,
         f"""
-        WITH latest_date AS (
-            SELECT COALESCE(MAX(game_date), CURRENT_DATE) AS max_game_date
-            FROM settled_bet_opportunities_deduped
-        )
         SELECT
             model_name,
             CAST(won_bet AS INTEGER) AS won_bet,
             realized_return_units,
             stake_units
         FROM settled_bet_opportunities_deduped
-        CROSS JOIN latest_date
-        WHERE game_date >= max_game_date - {window_days - 1}
+        WHERE game_date >= DATE '{cfg.betting_stats_start_date}'
         """,
     )
     if frame.empty:
@@ -168,16 +163,13 @@ def _window_performance(conn, window_days: int, min_bets: int) -> pd.DataFrame:
 
 
 def _fallback_logloss_champion(conn, window_days: int, min_bets: int) -> str | None:
-    """Pick the model with the lowest log-loss over settled predictions as a cold-start fallback."""
+    """Pick the model with the lowest log-loss since the configured betting-stats start date."""
+    cfg = settings()
     if not _table_has_rows(conn, "settled_predictions_deduped"):
         return None
     frame = query_dataframe(
         conn,
         f"""
-        WITH latest_date AS (
-            SELECT COALESCE(MAX(game_date), CURRENT_DATE) AS max_game_date
-            FROM settled_predictions_deduped
-        )
         SELECT
             model_name,
             COUNT(*) AS games,
@@ -188,8 +180,7 @@ def _fallback_logloss_champion(conn, window_days: int, min_bets: int) -> str | N
                 END
             ) AS log_loss
         FROM settled_predictions_deduped
-        CROSS JOIN latest_date
-        WHERE game_date >= max_game_date - {window_days - 1}
+        WHERE game_date >= DATE '{cfg.betting_stats_start_date}'
         GROUP BY model_name
         HAVING COUNT(*) >= {min_bets}
         ORDER BY log_loss ASC, games DESC, model_name
@@ -207,6 +198,7 @@ def _fallback_logloss_champion(conn, window_days: int, min_bets: int) -> str | N
                 END
             ) AS log_loss
             FROM settled_predictions_deduped
+            WHERE game_date >= DATE '{cfg.betting_stats_start_date}'
             GROUP BY model_name
             ORDER BY log_loss ASC, games DESC, model_name
             LIMIT 1
@@ -221,6 +213,7 @@ def select_champion_with_rationale(reference_date: str | None = None) -> Champio
 
     Applies guardrail logic: stick with the incumbent unless the best challenger's
     lower CI bound beats the incumbent's point estimate AND meets `min_bets`.
+    Performance is measured over all settled bets since `BETTING_STATS_START_DATE`.
     """
     cfg = settings()
     decision = ChampionDecision(
@@ -246,19 +239,24 @@ def select_champion_with_rationale(reference_date: str | None = None) -> Champio
             decision.chosen_model = fallback
             decision.challenger_model = fallback
             decision.action = "fallback_logloss"
-            decision.reason = "no settled bets yet; picking lowest log-loss model over the window"
+            decision.reason = (
+                f"no settled bets yet; picking lowest log-loss model since {cfg.betting_stats_start_date}"
+            )
             return decision
 
         performance = _window_performance(conn, cfg.strategy_champion_window_days, cfg.strategy_champion_min_bets)
         if performance.empty:
-            # widen to all-time
             performance = _window_performance(conn, window_days=10_000, min_bets=1)
             if performance.empty:
                 fallback = _fallback_logloss_champion(conn, 10_000, 1)
                 decision.chosen_model = fallback
                 decision.challenger_model = fallback
                 decision.action = "fallback_logloss" if fallback else "no_data"
-                decision.reason = "no bets in window; fell back to log-loss" if fallback else decision.reason
+                decision.reason = (
+                    f"no settled bets since {cfg.betting_stats_start_date}; fell back to log-loss"
+                    if fallback
+                    else decision.reason
+                )
                 return decision
 
         eligible = performance[performance["meets_min_bets"]].sort_values(
@@ -296,7 +294,7 @@ def select_champion_with_rationale(reference_date: str | None = None) -> Champio
         if challenger == incumbent:
             decision.chosen_model = incumbent
             decision.action = "kept_incumbent"
-            decision.reason = "incumbent is already the top performer in the window"
+            decision.reason = f"incumbent is already the top performer since {cfg.betting_stats_start_date}"
             return decision
 
         if not bool(challenger_row["meets_min_bets"]):

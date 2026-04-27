@@ -7,7 +7,7 @@ import pandas as pd
 
 from mlpm.config.settings import settings
 from mlpm.evaluation.settled import compute_settled_calibration
-from mlpm.evaluation.strategy import select_champion_model
+from mlpm.evaluation.strategy import select_champion_model, select_champion_with_rationale
 from mlpm.storage.duckdb import connect_read_only, query_dataframe
 
 
@@ -15,10 +15,14 @@ def _normalize_value(value: Any) -> Any:
     if value is None:
         return None
     if isinstance(value, pd.Timestamp):
+        if value.hour == 0 and value.minute == 0 and value.second == 0 and value.microsecond == 0 and value.nanosecond == 0:
+            return value.date().isoformat()
         if value.tzinfo is None:
             value = value.tz_localize("UTC")
         return value.isoformat()
     if isinstance(value, datetime):
+        if value.hour == 0 and value.minute == 0 and value.second == 0 and value.microsecond == 0:
+            return value.date().isoformat()
         if value.tzinfo is None:
             value = value.replace(tzinfo=timezone.utc)
         return value.isoformat()
@@ -51,19 +55,117 @@ def _one(sql: str, params: list[object] | None = None) -> dict[str, Any]:
     return _records(frame)[0]
 
 
+def _latest_collection_run_expr(alias: str = "") -> str:
+    prefix = f"{alias}." if alias else ""
+    return f"COALESCE({prefix}collection_run_ts, {prefix}snapshot_ts)"
+
+
+def _betting_stats_start_date() -> str:
+    return getattr(settings(), "betting_stats_start_date", "2025-01-01")
+
+
+def _latest_training_run_metadata(conn) -> dict[str, Any]:
+    frame = query_dataframe(
+        conn,
+        """
+        WITH ranked AS (
+            SELECT
+                trained_at,
+                train_start_date,
+                train_end_date,
+                rows_train,
+                rows_valid,
+                ROW_NUMBER() OVER (
+                    ORDER BY trained_at DESC, train_end_date DESC, train_start_date ASC, model_name ASC, rank ASC
+                ) AS row_num
+            FROM feature_importances
+        )
+        SELECT
+            trained_at,
+            train_start_date,
+            train_end_date,
+            rows_train,
+            rows_valid
+        FROM ranked
+        WHERE row_num = 1
+        """,
+    )
+    if frame.empty:
+        return {}
+    return _records(frame)[0]
+
+
+def _latest_training_metadata_by_model(conn) -> pd.DataFrame:
+    return query_dataframe(
+        conn,
+        """
+        WITH ranked AS (
+            SELECT
+                model_name,
+                trained_at,
+                train_start_date,
+                train_end_date,
+                rows_train,
+                rows_valid,
+                ROW_NUMBER() OVER (
+                    PARTITION BY model_name
+                    ORDER BY trained_at DESC, train_end_date DESC, train_start_date ASC, rank ASC, feature ASC
+                ) AS row_num
+            FROM feature_importances
+        )
+        SELECT
+            model_name,
+            trained_at,
+            train_start_date,
+            train_end_date,
+            rows_train,
+            rows_valid
+        FROM ranked
+        WHERE row_num = 1
+        """,
+    )
+
+
 def get_summary() -> dict[str, Any]:
     cfg = settings()
     base = _one(
-        """
+        f"""
+        WITH latest_run AS (
+            SELECT MAX({_latest_collection_run_expr()}) AS run_ts
+            FROM games_deduped
+        )
         SELECT
-            COUNT(*) AS total_discrepancies,
-            COALESCE(SUM(CASE WHEN flagged THEN 1 ELSE 0 END), 0) AS flagged_discrepancies,
-            COALESCE(AVG(ABS(gap_bps)), 0.0) AS avg_abs_gap_bps,
-            (SELECT MAX(snapshot_ts) FROM discrepancies_deduped) AS latest_snapshot_ts,
-            (SELECT MAX(game_date) FROM games_deduped) AS latest_game_date,
-            (SELECT COUNT(*) FROM bet_opportunities_deduped WHERE is_actionable = TRUE) AS actionable_bets,
-            (SELECT COALESCE(MAX(edge_bps), 0) FROM bet_opportunities_deduped) AS max_edge_bps
-        FROM discrepancies_deduped
+            COUNT(d.game_id) AS total_discrepancies,
+            COALESCE(SUM(CASE WHEN d.flagged THEN 1 ELSE 0 END), 0) AS flagged_discrepancies,
+            COALESCE(AVG(ABS(d.gap_bps)), 0.0) AS avg_abs_gap_bps,
+            (
+                SELECT MAX(d2.snapshot_ts)
+                FROM discrepancies_deduped d2
+                CROSS JOIN latest_run lr
+                WHERE {_latest_collection_run_expr("d2")} = lr.run_ts
+            ) AS latest_snapshot_ts,
+            (
+                SELECT MAX(g.game_date)
+                FROM games_deduped g
+                CROSS JOIN latest_run lr
+                WHERE {_latest_collection_run_expr("g")} = lr.run_ts
+            ) AS latest_game_date,
+            (
+                SELECT COUNT(*)
+                FROM bet_opportunities_deduped b
+                CROSS JOIN latest_run lr
+                WHERE {_latest_collection_run_expr("b")} = lr.run_ts
+                  AND b.is_actionable = TRUE
+            ) AS actionable_bets,
+            (
+                SELECT COALESCE(MAX(b.edge_bps), 0)
+                FROM bet_opportunities_deduped b
+                CROSS JOIN latest_run lr
+                WHERE {_latest_collection_run_expr("b")} = lr.run_ts
+            ) AS max_edge_bps
+        FROM discrepancies_deduped d
+        CROSS JOIN latest_run lr
+        WHERE {_latest_collection_run_expr("d")} = lr.run_ts
         """
     )
     latest_snapshot = base.get("latest_snapshot_ts")
@@ -103,32 +205,51 @@ def list_opportunities(
         filters.append("edge_bps >= ?")
         params.append(min_edge_bps)
 
-    where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
     offset = (max(page, 1) - 1) * page_size
     conn = connect_read_only(settings().duckdb_path)
     try:
-        total_frame = query_dataframe(conn, f"SELECT COUNT(*) AS total FROM bet_opportunities_deduped {where_clause}", params=params or None)
+        total_frame = query_dataframe(
+            conn,
+            f"""
+            WITH latest_run AS (
+                SELECT MAX({_latest_collection_run_expr()}) AS run_ts
+                FROM games_deduped
+            )
+            SELECT COUNT(*) AS total
+            FROM bet_opportunities_deduped b
+            CROSS JOIN latest_run lr
+            WHERE {_latest_collection_run_expr("b")} = lr.run_ts
+            {" AND " + " AND ".join(filters) if filters else ""}
+            """,
+            params=params or None,
+        )
         rows = query_dataframe(
             conn,
             f"""
+            WITH latest_run AS (
+                SELECT MAX({_latest_collection_run_expr()}) AS run_ts
+                FROM games_deduped
+            )
             SELECT
-                game_id,
-                game_date,
-                event_start_time,
-                model_name,
-                source,
-                market_id,
-                team,
-                opponent_team,
-                model_prob,
-                market_prob,
-                edge_bps,
-                expected_value,
-                is_actionable,
-                is_champion
-            FROM bet_opportunities_deduped
-            {where_clause}
-            ORDER BY edge_bps DESC, event_start_time ASC, model_name
+                b.game_id,
+                b.game_date,
+                b.event_start_time,
+                b.model_name,
+                b.source,
+                b.market_id,
+                b.team,
+                b.opponent_team,
+                b.model_prob,
+                b.market_prob,
+                b.edge_bps,
+                b.expected_value,
+                b.is_actionable,
+                b.is_champion
+            FROM bet_opportunities_deduped b
+            CROSS JOIN latest_run lr
+            WHERE {_latest_collection_run_expr("b")} = lr.run_ts
+            {" AND " + " AND ".join(filters) if filters else ""}
+            ORDER BY b.edge_bps DESC, b.event_start_time ASC, b.model_name
             LIMIT {page_size} OFFSET {offset}
             """,
             params=params or None,
@@ -150,20 +271,32 @@ def get_game_detail(game_id: str) -> dict[str, Any]:
     try:
         meta = query_dataframe(
             conn,
-            """
-            SELECT game_id, game_date, event_start_time, away_team, home_team
-            FROM games_deduped
-            WHERE game_id = ?
+            f"""
+            WITH latest_run AS (
+                SELECT MAX({_latest_collection_run_expr()}) AS run_ts
+                FROM games_deduped
+            )
+            SELECT g.game_id, g.game_date, g.event_start_time, g.away_team, g.home_team
+            FROM games_deduped g
+            CROSS JOIN latest_run lr
+            WHERE g.game_id = ?
+              AND {_latest_collection_run_expr("g")} = lr.run_ts
             LIMIT 1
             """,
             params=[game_id],
         )
         quotes = query_dataframe(
             conn,
-            """
-            SELECT source, market_id, team, market_prob, model_prob, gap_bps, snapshot_ts, flagged
-            FROM discrepancies_deduped
-            WHERE game_id = ?
+            f"""
+            WITH latest_run AS (
+                SELECT MAX({_latest_collection_run_expr()}) AS run_ts
+                FROM games_deduped
+            )
+            SELECT d.source, d.market_id, d.team, d.market_prob, d.model_prob, d.gap_bps, d.snapshot_ts, d.flagged
+            FROM discrepancies_deduped d
+            CROSS JOIN latest_run lr
+            WHERE d.game_id = ?
+              AND {_latest_collection_run_expr("d")} = lr.run_ts
             ORDER BY snapshot_ts DESC, source, team
             LIMIT 50
             """,
@@ -171,8 +304,12 @@ def get_game_detail(game_id: str) -> dict[str, Any]:
         )
         features = query_dataframe(
             conn,
-            """
-            WITH ranked AS (
+            f"""
+            WITH latest_run AS (
+                SELECT MAX({_latest_collection_run_expr()}) AS run_ts
+                FROM games_deduped
+            ),
+            ranked AS (
                 SELECT
                     game_id,
                     team,
@@ -193,8 +330,10 @@ def get_game_detail(game_id: str) -> dict[str, Any]:
                         PARTITION BY game_id, team, model_name
                         ORDER BY snapshot_ts DESC, collection_run_ts DESC
                     ) AS rn
-                FROM model_predictions_deduped
+                FROM model_predictions_deduped mp
+                CROSS JOIN latest_run lr
                 WHERE game_id = ?
+                  AND {_latest_collection_run_expr("mp")} = lr.run_ts
             )
             SELECT * EXCLUDE (rn)
             FROM ranked
@@ -267,7 +406,7 @@ def get_research_contenders() -> list[dict[str, Any]]:
     try:
         frame = query_dataframe(
             conn,
-            """
+            f"""
             SELECT
                 model_name AS model,
                 COUNT(*) AS games,
@@ -279,6 +418,7 @@ def get_research_contenders() -> list[dict[str, Any]]:
                     END
                 ) AS log_loss
             FROM settled_predictions_deduped
+            WHERE game_date >= DATE '{_betting_stats_start_date()}'
             GROUP BY model_name
             ORDER BY games DESC, model_name
             """
@@ -297,10 +437,11 @@ def get_research_strategies() -> list[dict[str, Any]]:
     try:
         frame = query_dataframe(
             conn,
-            """
+            f"""
             WITH latest_date AS (
                 SELECT MAX(game_date) AS max_game_date
                 FROM settled_bet_opportunities_deduped
+                WHERE game_date >= DATE '{_betting_stats_start_date()}'
             ),
             sliced AS (
                 SELECT
@@ -310,6 +451,7 @@ def get_research_strategies() -> list[dict[str, Any]]:
                     SUM(realized_return_units) AS slice_units,
                     SUM(stake_units) AS slice_stakes
                 FROM settled_bet_opportunities_deduped
+                WHERE game_date >= DATE '{_betting_stats_start_date()}'
                 GROUP BY model_name, DATE_TRUNC('month', game_date)
             )
             SELECT
@@ -331,6 +473,7 @@ def get_research_strategies() -> list[dict[str, Any]]:
                     SUM(realized_return_units) / NULLIF(SUM(stake_units), 0) AS roi,
                     SUM(realized_return_units) AS units_won
                 FROM settled_bet_opportunities_deduped
+                WHERE game_date >= DATE '{_betting_stats_start_date()}'
                 GROUP BY model_name
             ) totals
               ON s.model_name = totals.model_name
@@ -342,6 +485,61 @@ def get_research_strategies() -> list[dict[str, Any]]:
         conn.close()
     frame["family"] = frame["strategy_name"].map(_infer_model_family)
     return _records(frame)
+
+
+def get_champion_standings() -> dict[str, Any]:
+    cfg = settings()
+    decision = select_champion_with_rationale()
+    conn = connect_read_only(cfg.duckdb_path)
+    try:
+        frame = query_dataframe(
+            conn,
+            f"""
+            SELECT
+                model_name,
+                COUNT(*) AS bets,
+                SUM(CASE WHEN won_bet THEN 1 ELSE 0 END) AS wins,
+                AVG(CASE WHEN won_bet THEN 1.0 ELSE 0.0 END) AS win_rate,
+                SUM(realized_return_units) AS units_won,
+                SUM(realized_return_units) / NULLIF(SUM(stake_units), 0) AS roi,
+                AVG(edge_bps) AS avg_edge_bps,
+                MIN(game_date) AS first_game_date,
+                MAX(game_date) AS last_game_date
+            FROM settled_bet_opportunities_deduped
+            WHERE game_date >= DATE '{_betting_stats_start_date()}'
+            GROUP BY model_name
+            ORDER BY roi DESC NULLS LAST, units_won DESC NULLS LAST, model_name
+            """
+        )
+    finally:
+        conn.close()
+    if frame.empty:
+        return {
+            "betting_stats_start_date": _betting_stats_start_date(),
+            "champion_model": decision.chosen_model,
+            "decision_reason": decision.reason,
+            "decision_action": decision.action,
+            "rows": [],
+        }
+
+    frame["family"] = frame["model_name"].map(_infer_model_family)
+    frame["is_champion"] = frame["model_name"].eq(decision.chosen_model)
+    frame["ci_lower"] = frame["model_name"].map(
+        lambda name: decision.challenger_ci_lower if name == decision.challenger_model else None
+    )
+    frame["ci_upper"] = frame["model_name"].map(
+        lambda name: decision.challenger_ci_upper if name == decision.challenger_model else None
+    )
+    frame["incumbent_point_metric"] = frame["model_name"].map(
+        lambda name: decision.incumbent_win_rate if name == decision.incumbent_model else None
+    )
+    return {
+        "betting_stats_start_date": _betting_stats_start_date(),
+        "champion_model": decision.chosen_model,
+        "decision_reason": decision.reason,
+        "decision_action": decision.action,
+        "rows": _records(frame),
+    }
 
 
 def get_calibration(*, bins: int = 10) -> list[dict[str, Any]]:
@@ -457,16 +655,7 @@ def get_training_coverage() -> dict[str, Any]:
             WHERE fair_prob IS NOT NULL
             """,
         )
-        latest_model = query_dataframe(
-            conn,
-            """
-            SELECT
-                MAX(train_start_date) AS train_start_date,
-                MAX(train_end_date)   AS train_end_date,
-                MAX(trained_at)       AS trained_at
-            FROM feature_importances
-            """,
-        )
+        latest_model = _latest_training_run_metadata(conn)
     finally:
         conn.close()
 
@@ -496,7 +685,7 @@ def get_training_coverage() -> dict[str, Any]:
     finally:
         conn.close()
     total = int(total_frame.iloc[0]["total_games_with_prior"]) if not total_frame.empty else 0
-    meta = latest_model.iloc[0] if not latest_model.empty else {}
+    meta = latest_model or {}
     return {
         "rows": _records(rows),
         "train_start_date": settings().model_train_start_date,
@@ -542,7 +731,7 @@ def get_sizing_comparison() -> list[dict[str, Any]]:
     try:
         bets = query_dataframe(
             conn,
-            """
+            f"""
             SELECT
                 model_name,
                 edge_bps,
@@ -553,6 +742,7 @@ def get_sizing_comparison() -> list[dict[str, Any]]:
             WHERE implied_decimal_odds IS NOT NULL
               AND model_prob IS NOT NULL
               AND won_bet IS NOT NULL
+              AND game_date >= DATE '{_betting_stats_start_date()}'
             """,
         )
     finally:
@@ -636,7 +826,7 @@ def _compute_ensemble_sizing() -> dict[str, Any] | None:
     try:
         frame = query_dataframe(
             conn,
-            """
+            f"""
             SELECT
                 game_id,
                 team,
@@ -648,6 +838,7 @@ def _compute_ensemble_sizing() -> dict[str, Any] | None:
             WHERE implied_decimal_odds IS NOT NULL
               AND model_prob IS NOT NULL
               AND won_bet IS NOT NULL
+              AND game_date >= DATE '{_betting_stats_start_date()}'
             GROUP BY game_id, team
             HAVING COUNT(*) >= 2
             """,
@@ -712,7 +903,7 @@ def get_model_roster() -> list[dict[str, Any]]:
     try:
         contenders = query_dataframe(
             conn,
-            """
+            f"""
             SELECT
                 model_name,
                 COUNT(*) AS games,
@@ -724,35 +915,25 @@ def get_model_roster() -> list[dict[str, Any]]:
                     END
                 ) AS log_loss
             FROM settled_predictions_deduped
+            WHERE game_date >= DATE '{_betting_stats_start_date()}'
             GROUP BY model_name
             """,
         )
         strategies = query_dataframe(
             conn,
-            """
+            f"""
             SELECT
                 model_name,
                 COUNT(*) AS bets,
                 SUM(realized_return_units) / NULLIF(SUM(stake_units), 0) AS roi,
                 SUM(realized_return_units) AS units_won
             FROM settled_bet_opportunities_deduped
+            WHERE game_date >= DATE '{_betting_stats_start_date()}'
             GROUP BY model_name
             """,
         )
-        training = query_dataframe(
-            conn,
-            """
-            SELECT
-                model_name,
-                MAX(trained_at)        AS trained_at,
-                MAX(train_start_date)  AS train_start_date,
-                MAX(train_end_date)    AS train_end_date,
-                MAX(rows_train)        AS rows_train,
-                MAX(rows_valid)        AS rows_valid
-            FROM feature_importances
-            GROUP BY model_name
-            """,
-        )
+        training = _latest_training_metadata_by_model(conn)
+        latest_training = _latest_training_run_metadata(conn)
     finally:
         conn.close()
 
@@ -760,16 +941,33 @@ def get_model_roster() -> list[dict[str, Any]]:
         contender_row = contenders[contenders["model_name"] == name]
         strategy_row = strategies[strategies["model_name"] == name]
         training_row = training[training["model_name"] == name]
+        training_values = (
+            {
+                "trained_at": _normalize_value(training_row["trained_at"].iloc[0]),
+                "train_start_date": _normalize_value(training_row["train_start_date"].iloc[0]),
+                "train_end_date": _normalize_value(training_row["train_end_date"].iloc[0]),
+                "rows_train": int(training_row["rows_train"].iloc[0]) if pd.notna(training_row["rows_train"].iloc[0]) else None,
+                "rows_valid": int(training_row["rows_valid"].iloc[0]) if pd.notna(training_row["rows_valid"].iloc[0]) else None,
+            }
+            if not training_row.empty
+            else {
+                "trained_at": latest_training.get("trained_at"),
+                "train_start_date": latest_training.get("train_start_date"),
+                "train_end_date": latest_training.get("train_end_date"),
+                "rows_train": latest_training.get("rows_train"),
+                "rows_valid": latest_training.get("rows_valid"),
+            }
+        )
         return {
             "model_name": name,
             "family": _infer_model_family(name),
             "feature_variant": _infer_feature_variant(name),
             "role": "champion" if name == champion else "challenger",
-            "trained_at": _normalize_value(training_row["trained_at"].iloc[0]) if not training_row.empty else None,
-            "train_start_date": _normalize_value(training_row["train_start_date"].iloc[0]) if not training_row.empty else None,
-            "train_end_date": _normalize_value(training_row["train_end_date"].iloc[0]) if not training_row.empty else None,
-            "rows_train": int(training_row["rows_train"].iloc[0]) if not training_row.empty and pd.notna(training_row["rows_train"].iloc[0]) else None,
-            "rows_valid": int(training_row["rows_valid"].iloc[0]) if not training_row.empty and pd.notna(training_row["rows_valid"].iloc[0]) else None,
+            "trained_at": training_values["trained_at"],
+            "train_start_date": training_values["train_start_date"],
+            "train_end_date": training_values["train_end_date"],
+            "rows_train": training_values["rows_train"],
+            "rows_valid": training_values["rows_valid"],
             "settled_bets": int(strategy_row["bets"].iloc[0]) if not strategy_row.empty and pd.notna(strategy_row["bets"].iloc[0]) else 0,
             "accuracy": float(contender_row["accuracy"].iloc[0]) if not contender_row.empty and pd.notna(contender_row["accuracy"].iloc[0]) else None,
             "log_loss": float(contender_row["log_loss"].iloc[0]) if not contender_row.empty and pd.notna(contender_row["log_loss"].iloc[0]) else None,

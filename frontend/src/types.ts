@@ -95,6 +95,31 @@ export interface Strategy {
   guardrails_passed: boolean;
 }
 
+export interface ChampionStandingRow {
+  model_name: string;
+  family: string | null;
+  bets: number;
+  wins: number;
+  win_rate: number | null;
+  units_won: number | null;
+  roi: number | null;
+  avg_edge_bps: number | null;
+  first_game_date: string | null;
+  last_game_date: string | null;
+  is_champion: boolean;
+  ci_lower: number | null;
+  ci_upper: number | null;
+  incumbent_point_metric: number | null;
+}
+
+export interface ChampionStandings {
+  betting_stats_start_date: string;
+  champion_model: string | null;
+  decision_reason: string;
+  decision_action: string;
+  rows: ChampionStandingRow[];
+}
+
 export interface Contender {
   model: string;
   family: string | null;

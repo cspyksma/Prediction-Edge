@@ -138,6 +138,31 @@ class ResearchStrategyRow(BaseModel):
     guardrails_passed: bool = False
 
 
+class ChampionStandingRow(BaseModel):
+    model_name: str
+    family: str | None = None
+    bets: int
+    wins: int
+    win_rate: float | None = None
+    units_won: float | None = None
+    roi: float | None = None
+    avg_edge_bps: float | None = None
+    first_game_date: str | None = None
+    last_game_date: str | None = None
+    is_champion: bool = False
+    ci_lower: float | None = None
+    ci_upper: float | None = None
+    incumbent_point_metric: float | None = None
+
+
+class ChampionStandingsResponse(BaseModel):
+    betting_stats_start_date: str
+    champion_model: str | None = None
+    decision_reason: str
+    decision_action: str
+    rows: list[ChampionStandingRow]
+
+
 class TrainingCoverageRow(BaseModel):
     source: str
     label: str

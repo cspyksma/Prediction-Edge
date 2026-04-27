@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import duckdb
@@ -775,9 +776,37 @@ FROM historical_import_runs
 GROUP BY source, start_date, end_date;
 """
 
+LOCK_RETRY_ATTEMPTS = 20
+LOCK_RETRY_DELAY_SECONDS = 0.25
+
+
+def _is_lock_conflict(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "being used by another process" in message or "cannot open file" in message
+
+
+def _open_connection(path: Path, *, read_only: bool) -> duckdb.DuckDBPyConnection:
+    last_error: BaseException | None = None
+    for attempt in range(LOCK_RETRY_ATTEMPTS):
+        try:
+            return duckdb.connect(str(path), read_only=read_only)
+        except duckdb.IOException as exc:
+            last_error = exc
+            if not _is_lock_conflict(exc) or attempt == (LOCK_RETRY_ATTEMPTS - 1):
+                break
+            time.sleep(LOCK_RETRY_DELAY_SECONDS)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Unable to open DuckDB connection for path={path}")
+
+
+def ensure_database(path: Path) -> None:
+    conn = connect(path)
+    conn.close()
+
 
 def connect(path: Path) -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(str(path))
+    conn = _open_connection(path, read_only=False)
     conn.execute(SCHEMA_SQL)
     for statement in MIGRATION_SQL:
         conn.execute(statement)
@@ -828,7 +857,7 @@ def connect(path: Path) -> duckdb.DuckDBPyConnection:
 
 
 def connect_read_only(path: Path) -> duckdb.DuckDBPyConnection:
-    return duckdb.connect(str(path), read_only=True)
+    return _open_connection(path, read_only=True)
 
 
 def append_dataframe(conn: duckdb.DuckDBPyConnection, table_name: str, frame: pd.DataFrame) -> None:

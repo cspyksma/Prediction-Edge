@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     model_home_field_edge_bps: int = Field(default=350, alias="MODEL_HOME_FIELD_EDGE_BPS")
     model_min_games: int = Field(default=25, alias="MODEL_MIN_GAMES")
     model_selection_metric: str = Field(default="log_loss", alias="MODEL_SELECTION_METRIC")
+    betting_stats_start_date: str = Field(default="2025-01-01", alias="BETTING_STATS_START_DATE")
     # Default covers the full available historical record: SBRO closing-line
     # moneylines 2015-2021, plus Kalshi ticker-based replay 2025+, plus live
     # quotes from the current season. Earlier defaults silently restricted
